@@ -26,6 +26,12 @@
   <button class="tab" data-tab="chunks" role="tab"><b>02</b> Нарезка</button>
   <button class="tab" data-tab="compare" role="tab"><b>03</b> Сравнение</button>
   <button class="tab" data-tab="search" role="tab"><b>04</b> Поиск</button>
+  <button class="tab" data-tab="ask" role="tab"><b>05</b> Вопрос · RAG</button>
+  <button class="tab" data-tab="quality" role="tab"><b>06</b> Качество</button>
+  <button class="tab" data-tab="rerank" role="tab"><b>07</b> Реранкинг</button>
+  <button class="tab" data-tab="cite" role="tab"><b>08</b> Цитаты</button>
+  <button class="tab" data-tab="chat" role="tab"><b>09</b> Чат</button>
+  <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
 <main>
@@ -88,6 +94,133 @@
     <div class="chips" id="examples"></div>
     <div class="muted small" id="search-meta"></div>
     <div class="grid2" id="results"></div>
+  </section>
+
+  <!-- 05 ВОПРОС · RAG -->
+  <section class="view" id="view-ask">
+    <div class="flow" id="rag-flow"></div>
+    <form class="searchbar" id="ask-form">
+      <input id="ask-q" autocomplete="off" placeholder="Вопрос о «Моби Дике» (главы 1–40), например: из чего была нога Ахава?">
+      <select id="ask-k" title="Сколько отрывков отдать модели"><option value="3">top-3</option><option value="5" selected>top-5</option><option value="8">top-8</option></select>
+      <button class="btn btn--primary" type="submit" id="ask-btn">Спросить</button>
+    </form>
+    <div class="chips" id="ask-examples"></div>
+    <details class="panel tune" id="tune">
+      <summary class="panel__title">Настройки улучшенного RAG (rewrite → фильтр → реранкер) <span class="muted small" id="tune-sum"></span></summary>
+      <div class="tune__grid">
+        <label>запрос для поиска<select id="t-query"><option value="raw">raw — вопрос как есть</option><option value="en">en — перевод на английский</option><option value="hyde">hyde — гипотетический отрывок</option></select></label>
+        <label>top-K до фильтра <b id="v-k_before"></b><input type="range" id="t-k_before" min="5" max="40" step="1"></label>
+        <label>порог косинуса <b id="v-sim_min"></b><input type="range" id="t-sim_min" min="0" max="0.7" step="0.01"></label>
+        <label class="check"><input type="checkbox" id="t-rerank"> реранкер Qwen3-Reranker</label>
+        <label>порог реранкера <b id="v-rel_min"></b><input type="range" id="t-rel_min" min="0" max="0.95" step="0.05"></label>
+        <label>top-K после фильтра <b id="v-k_after"></b><input type="range" id="t-k_after" min="1" max="10" step="1"></label>
+      </div>
+      <div class="controls" style="margin:10px 0 0;"><button class="btn" type="button" id="t-reset">сбросить к рекомендованным</button><span class="muted small" id="t-note"></span></div>
+    </details>
+    <div id="ask-expected"></div>
+    <div class="grid3" id="answers"></div>
+    <div class="panel" id="ask-funnel" hidden></div>
+    <div class="panel" id="ask-sources" hidden></div>
+  </section>
+
+  <!-- 06 КАЧЕСТВО -->
+  <section class="view" id="view-quality">
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Прогон контрольных вопросов</div>
+        <div class="muted small" style="margin-bottom:10px;">10 вопросов из <code>eval/rag.json</code>: на каждый — ответ без RAG, ответ с RAG и оценка судьи (верно / частично / неверно) по эталону. Код отдельно проверяет, попала ли нужная глава в найденные отрывки.</div>
+        <div class="controls">
+          <label class="model-pick inline"><span>отвечает</span><b id="eval-model"></b></label>
+          <label class="model-pick inline"><span>судья</span><select id="judge-select"></select></label>
+          <label class="check"><input type="checkbox" id="eval-force"> заново</label>
+          <button class="btn btn--primary" id="btn-eval">▶ Запустить прогон</button>
+        </div>
+        <div class="progress"><div class="progress__bar" id="eval-bar"></div></div>
+        <div class="console console--short" id="eval-console"><div class="muted">Журнал прогона появится здесь.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Сохранённые прогоны</div><div id="runs"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Итог <span class="muted small" id="q-model"></span></div><div id="q-totals"></div></div>
+    <div class="panel"><div class="panel__title">Вопросы: ожидание, источник и ответы</div><div id="q-table"></div></div>
+  </section>
+
+  <!-- 07 РЕРАНКИНГ -->
+  <section class="view" id="view-rerank">
+    <div class="flow" id="rr-flow"></div>
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Подбор порогов и сравнение режимов</div>
+        <div class="muted small" style="margin-bottom:10px;">34 вопроса: 29 с известной главой (20 из Дня 21 и 9 из Дня 22) и 5 без ответа в индексе (<code>eval/noanswer.json</code>). Для каждого вопроса и режима запроса берутся top-20 кандидатов, реранкер оценивает каждого один раз; дальше метрики любых порогов считаются мгновенно — двигайте ползунки.</div>
+        <div class="controls"><label class="model-pick inline"><span>rewrite</span><b id="rr-model"></b></label><button class="btn btn--primary" id="btn-rr">▶ Запустить эксперимент</button><span class="muted small" id="rr-meta"></span></div>
+        <div class="progress"><div class="progress__bar" id="rr-bar"></div></div>
+        <div class="console console--short" id="rr-console"><div class="muted">Журнал эксперимента появится здесь.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Рекомендация</div><div id="rr-rec" class="kv">—</div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Режимы: без фильтра/rewrite и с ними <span class="muted small" id="rr-thr"></span></div><div id="rr-table"></div></div>
+    <div class="grid2">
+      <div class="panel"><div class="panel__title">Живая настройка воронки</div><div id="rr-live"></div></div>
+      <div class="panel"><div class="panel__title">Порог реранкера → качество контекста</div><div id="rr-sweep"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Вопросы без ответа: что фильтр пропустил в модель</div><div id="rr-noans"></div></div>
+  </section>
+
+  <!-- 08 ЦИТАТЫ -->
+  <section class="view" id="view-cite">
+    <div class="flow" id="ct-flow"></div>
+    <form class="searchbar" id="ct-form">
+      <input id="ct-q" autocomplete="off" placeholder="Вопрос о «Моби Дике»: ответ будет только с источниками и дословными цитатами">
+      <label class="model-pick inline" title="Порог уверенности: если лучшая оценка реранкера ниже — «не знаю»"><span>«не знаю» если &lt;</span><input type="number" id="ct-gate" min="0" max="1" step="0.05" style="width:64px;background:var(--panel);border:1px solid var(--line-2);border-radius:4px;padding:5px 6px;font-family:var(--mono)"></label>
+      <button class="btn btn--primary" type="submit" id="ct-btn">Спросить</button>
+    </form>
+    <div class="chips" id="ct-examples"></div>
+    <div id="ct-expected"></div>
+    <div id="ct-result"></div>
+
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Проверка на 10 контрольных вопросах</div>
+        <div class="muted small" style="margin-bottom:10px;">Для каждого вопроса: есть ли источники, есть ли цитаты и подтверждены ли они текстом, совпадает ли смысл ответа с цитатами (судья + кросс-энкодер), верен ли ответ по эталону, сработал ли «не знаю» на вопросе-ловушке.</div>
+        <div class="controls"><label class="model-pick inline"><span>отвечает</span><b id="ct-model"></b></label><label class="model-pick inline"><span>судья</span><select id="ct-judge"></select></label><button class="btn btn--primary" id="btn-ct-eval">▶ Запустить проверку</button></div>
+        <div class="progress"><div class="progress__bar" id="ct-bar"></div></div>
+        <div class="console console--short" id="ct-console"><div class="muted">Журнал проверки появится здесь.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Сохранённые проверки</div><div id="ct-runs"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Итог <span class="muted small" id="ct-run-meta"></span></div><div id="ct-totals"></div></div>
+    <div class="panel"><div class="panel__title">Вопросы</div><div id="ct-table"></div></div>
+  </section>
+
+  <!-- 09 ЧАТ -->
+  <section class="view" id="view-chat">
+    <div class="chat-layout">
+      <aside class="panel chat-list">
+        <div class="panel__title">Чаты</div>
+        <button class="btn btn--primary" id="btn-chat-new" style="width:100%;margin-bottom:10px;">+ Новый чат</button>
+        <div id="chat-list"></div>
+      </aside>
+      <div class="panel chat-main">
+        <div class="chat-head"><b id="chat-title">—</b><span class="muted small mono" id="chat-goal-line"></span></div>
+        <div class="chat-log" id="chat-log"><div class="empty">Создайте чат. Начните с цели: «Цель — …», задайте ограничения («только главы 1–20»), термины — и спрашивайте. Каждый ответ — по тексту книги и с источниками.</div></div>
+        <form class="chat-input" id="chat-form">
+          <textarea id="chat-msg" rows="2" placeholder="Сообщение… Enter — отправить, Shift+Enter — новая строка"></textarea>
+          <button class="btn btn--primary" type="submit" id="chat-send">Отправить</button>
+        </form>
+      </div>
+      <aside class="panel chat-mem">
+        <div class="panel__title">Память задачи <button class="link" type="button" id="mem-reset" title="очистить память задачи">сбросить</button></div>
+        <div id="chat-mem"><div class="muted small">Появится после первого сообщения.</div></div>
+      </aside>
+    </div>
+
+    <div class="panel">
+      <div class="panel__title">Длинные сценарии: не теряет ли ассистент цель и источники</div>
+      <div class="muted small" style="margin-bottom:10px;">2 сценария по 13 сообщений (<code>eval/chat_scenarios.json</code>): цель, ограничение по главам, термины, уточняющие вопросы с местоимениями, вопрос не по теме, вопрос, ответа на который нет в индексе, и «подведи итог». На каждом ходе проверяется: тип реплики, цель сохранена, диапазон глав сохранён и соблюдён в поиске, источники выведены, нужная глава найдена.</div>
+      <div class="controls"><label class="model-pick inline"><span>модель</span><b id="sc-model"></b></label><button class="btn btn--primary" id="btn-sc">▶ Прогнать сценарии</button><span class="muted small" id="sc-meta"></span></div>
+      <div class="progress"><div class="progress__bar" id="sc-bar"></div></div>
+      <div class="console console--short" id="sc-console"><div class="muted">Журнал прогона появится здесь.</div></div>
+      <div id="sc-results"></div>
+    </div>
   </section>
 </main>
 

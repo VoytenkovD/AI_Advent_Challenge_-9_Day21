@@ -476,6 +476,939 @@
     $('q').focus();
   };
 
+  // ═════════════ LLM: выбор модели (общий для вкладок 05 и 06) ═════════════
+  var models = { list: [], current: null };
+
+  function fillModelSelect(sel, value) {
+    clear(sel);
+    models.catalog && Object.keys(models.catalog.providers).forEach(function (p) {
+      var info = models.catalog.providers[p];
+      var og = h('optgroup', { label: p + (info.ok ? '' : ' — недоступен') });
+      info.models.forEach(function (m) { og.appendChild(h('option', { value: p + ':' + m, text: m })); });
+      if (!info.models.length) og.appendChild(h('option', { disabled: 'disabled', text: info.ok ? 'нет моделей' : (info.error || '').slice(0, 60) }));
+      sel.appendChild(og);
+    });
+    if (value) sel.value = value;
+  }
+
+  function loadModels() {
+    if (models.catalog) return Promise.resolve(models.catalog);
+    return api('/api/llm/models').then(function (c) {
+      models.catalog = c;
+      var saved = lsGet('model');
+      models.current = saved || c.default;
+      fillModelSelect($('model-select'), models.current);
+      if ($('model-select').value !== models.current) { models.current = c.default; $('model-select').value = c.default; }
+      fillModelSelect($('judge-select'), lsGet('judge') || models.current);
+      $('eval-model').textContent = models.current;
+      return c;
+    });
+  }
+  $('model-select').addEventListener('change', function () {
+    models.current = this.value; lsSet('model', this.value);
+    $('eval-model').textContent = this.value;
+    if (document.getElementById('view-quality').classList.contains('active')) loadRuns();
+  });
+  $('judge-select').addEventListener('change', function () { lsSet('judge', this.value); });
+
+  // ═════════════ 05 ВОПРОС · RAG ═════════════
+  var ragQuestions = [];
+  var askQuestion = null;
+
+  function renderFlow() {
+    var box = clear($('rag-flow'));
+    [['p', 'без RAG: вопрос → LLM'], ['', '|'],
+     ['r', 'RAG: вопрос → bge-m3 → top-5'], ['', '→'], ['r', 'вопрос + отрывки [n] → LLM'], ['', '|'],
+     ['g', 'RAG + rerank: rewrite'], ['', '→'], ['g', 'top-K до'], ['', '→'], ['g', 'порог косинуса'], ['', '→'], ['g', 'реранкер + порог'], ['', '→'], ['g', 'top-K после → LLM']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' || x[1] === '|' ? h('i', { text: x[1] }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  function withCites(text, onCite) {
+    var box = h('div', { class: 'answer__text' });
+    text.split(/(\[\d+(?:\s*,\s*\d+)*\])/).forEach(function (part) {
+      var m = part.match(/^\[(\d+(?:\s*,\s*\d+)*)\]$/);
+      if (!m) { box.appendChild(document.createTextNode(part)); return; }
+      m[1].split(',').forEach(function (n) {
+        n = +n.trim();
+        box.appendChild(h('span', { class: 'cite', text: n, title: 'отрывок ' + n, onclick: function () { onCite(n); } }));
+      });
+    });
+    return box;
+  }
+
+  var KIND = {
+    plain: ['Без RAG', 'по памяти модели', 'модель вспоминает'],
+    rag: ['RAG', 'вопрос как есть, top-5', 'ищу отрывки и читаю'],
+    rag2: ['RAG + rerank', 'rewrite → фильтр → реранкер', 'переписываю вопрос, фильтрую и ранжирую']
+  };
+
+  function answerPanel(kind, a) {
+    var title = KIND[kind][0];
+    var sub = KIND[kind][1];
+    var p = h('div', { class: 'panel answer answer--' + kind },
+      h('div', { class: 'answer__head' }, h('div', null, h('span', { class: 'answer__name', text: title }), ' ', h('span', { class: 'muted small', text: sub })),
+        a && a.model ? h('span', { class: 'muted small mono', text: a.model }) : null));
+    if (!a) { p.appendChild(h('div', { class: 'thinking', text: KIND[kind][2] })); return p; }
+    if (a.error) { p.appendChild(h('div', { class: 'flag warn', text: a.error })); return p; }
+    p.appendChild(kind === 'plain' ? h('div', { class: 'answer__text', text: a.text })
+      : withCites(a.text, function (n) { flashSource(n, kind); }));
+    var meta = h('div', { class: 'answer__meta' },
+      h('span', { class: 'flag', text: (a.latency_ms / 1000).toFixed(1) + ' с' }),
+      h('span', { class: 'flag', text: 'промпт ' + a.usage.prompt + ' · ответ ' + a.usage.completion + ' ток.' }));
+    if (kind === 'rag2' && a.funnel) {
+      var fc = a.funnel.counts;
+      meta.appendChild(h('span', { class: 'flag ' + (fc.kept ? '' : 'warn'), text: 'отрывков: ' + fc.before + ' → ' + fc.kept }));
+    }
+    if (kind !== 'plain') {
+      meta.appendChild(h('span', { class: 'flag', text: 'поиск ' + a.search_ms + ' мс' }));
+      meta.appendChild(h('span', { class: 'flag' + (a.cited.length ? ' ok' : ' warn'), text: a.cited.length ? 'ссылки: ' + a.cited.join(', ') : 'без ссылок на отрывки' }));
+      if (askQuestion && askQuestion.chapters.length) {
+        var hit = a.sources.some(function (s) { return s.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; }); });
+        meta.appendChild(h('span', { class: 'flag ' + (hit ? 'ok' : 'warn'), text: hit ? 'нужная глава в отрывках' : 'нужной главы нет в отрывках' }));
+      }
+    }
+    p.appendChild(meta);
+    return p;
+  }
+
+  function flashSource(n, kind) {
+    var el = kind === 'rag2' ? document.querySelector('#ask-funnel tr[data-final="' + n + '"]')
+      : document.querySelector('#ask-sources .src[data-n="' + n + '"]');
+    if (!el) return;
+    el.classList.add('open', 'flash');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setTimeout(function () { el.classList.remove('flash'); }, 1600);
+  }
+
+  function renderSources(a) {
+    var box = $('ask-sources');
+    if (!a || !a.sources) { box.hidden = true; return; }
+    box.hidden = false;
+    clear(box).appendChild(h('div', { class: 'panel__title', text: 'Отрывки, которые получила модель (' + a.sources.length + ', стратегия structure, ' + a.prompt_chars + ' символов контекста)' }));
+    a.sources.forEach(function (s) {
+      var expectedHit = askQuestion && s.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; });
+      var row = h('div', { class: 'src', 'data-n': s.n },
+        h('div', { class: 'src__n' + (a.cited.indexOf(s.n) !== -1 ? ' cited' : ''), text: '[' + s.n + ']', title: a.cited.indexOf(s.n) !== -1 ? 'модель сослалась на этот отрывок' : '' }),
+        h('div', null,
+          h('div', { class: 'src__head' }, h('span', null, (expectedHit ? '✔ ' : '') + s.section),
+            h('span', { class: 'muted' }, s.chunk_id + ' · сходство ' + s.similarity.toFixed(3) + ' · ' + s.tokens + ' ток. ',
+              h('button', { class: 'link', type: 'button', text: 'в нарезке →', onclick: function () { openInChunks(s); } }))),
+          h('div', { class: 'src__text', text: s.text, title: 'клик — развернуть', onclick: function () { row.classList.toggle('open'); } })));
+      box.appendChild(row);
+    });
+  }
+
+  // ── настройки воронки улучшенного RAG ──
+  var rr = { config: null };
+  var TUNE = ['k_before', 'sim_min', 'rel_min', 'k_after'];
+
+  function tuneParams() {
+    var p = { query: $('t-query').value, rerank: $('t-rerank').checked };
+    TUNE.forEach(function (k) { p[k] = +$('t-' + k).value; });
+    return p;
+  }
+
+  function tuneSummary() {
+    var p = tuneParams();
+    TUNE.forEach(function (k) { $('v-' + k).textContent = p[k]; });
+    $('t-rel_min').disabled = !p.rerank;
+    $('tune-sum').textContent = '— ' + p.query + ' · top-' + p.k_before + ' → cos ≥ ' + p.sim_min +
+      (p.rerank ? ' → реранкер ≥ ' + p.rel_min : ' · без реранкера') + ' → top-' + p.k_after;
+    lsSet('tune', JSON.stringify(p));
+  }
+
+  function setTune(p) {
+    $('t-query').value = p.query; $('t-rerank').checked = !!p.rerank;
+    TUNE.forEach(function (k) { $('t-' + k).value = p[k]; });
+    tuneSummary();
+  }
+
+  function loadTune() {
+    if (rr.config) return Promise.resolve(rr.config);
+    return api('/api/rerank/config').then(function (c) {
+      rr.config = c;
+      var saved = null;
+      try { saved = JSON.parse(lsGet('tune') || 'null'); } catch (e) {}
+      setTune(saved || c.improved);
+      $('t-note').textContent = c.reranker.pulled ? 'реранкер: ' + c.reranker.model : '⚠ реранкер ' + c.reranker.model + ' не скачан: ollama pull ' + c.reranker.model;
+      return c;
+    });
+  }
+  ['t-query', 't-rerank'].concat(TUNE.map(function (k) { return 't-' + k; })).forEach(function (id) {
+    $(id).addEventListener('input', tuneSummary);
+  });
+  $('t-reset').addEventListener('click', function () { if (rr.config) setTune(rr.config.improved); });
+
+  function renderFunnel(a) {
+    var box = $('ask-funnel');
+    if (!a || !a.funnel) { box.hidden = true; return; }
+    var f = a.funnel, c = f.counts, p = f.params;
+    box.hidden = false;
+    clear(box).appendChild(h('div', { class: 'panel__title', text: 'Как искал улучшенный RAG' }));
+    if (p.query !== 'raw') box.appendChild(h('div', null, h('span', { class: 'muted small mono', text: 'запрос для поиска (' + p.query + ', ' + f.ms.rewrite + ' мс):' }), h('div', { class: 'fq', text: f.query })));
+    box.appendChild(h('div', { class: 'fcounts' },
+      h('span', null, 'кандидатов ', h('b', { text: c.before })), h('i', { text: '→' }),
+      h('span', null, 'cos ≥ ' + p.sim_min + ': ', h('b', { text: c.passed_sim })), h('i', { text: '→' }),
+      p.rerank ? [h('span', null, 'реранкер ≥ ' + p.rel_min + ': ', h('b', { text: c.passed_rel })), h('i', { text: '→' })] : null,
+      h('span', null, 'в модель ', h('b', { text: c.kept })),
+      h('span', { class: 'muted', text: 'поиск ' + f.ms.search + ' мс · реранкер ' + f.ms.rerank + ' мс' + (f.rerank_cached ? ' (из кэша ' + f.rerank_cached + ')' : '') })));
+    var tbl = h('table', { class: 't cand' }, h('tr', null, h('th', { text: '#' }), h('th', { text: 'отрывок' }), h('th', { text: 'косинус' }),
+      h('th', { text: 'реранкер' }), h('th', { text: 'итог' })));
+    f.candidates.forEach(function (x) {
+      var hit = askQuestion && x.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; });
+      tbl.appendChild(h('tr', { class: x.stage, 'data-final': x.final || '' },
+        h('td', { class: 'num', text: x.rank }),
+        h('td', null, (hit ? '✔ ' : '') + x.section, h('div', { class: 'muted small', text: x.chunk_id })),
+        h('td', { class: 'num', text: x.cos.toFixed(3) }),
+        h('td', { class: 'num' }, x.rel == null ? '—' : [h('span', { class: 'relbar' }, h('i', { style: 'width:' + Math.round(x.rel * 100) + '%' })), x.rel.toFixed(2)]),
+        h('td', null, h('span', { class: 'stage ' + x.stage, text: x.stage === 'kept' ? '[' + x.final + '] в модель' : x.stage === 'top' ? 'не вошёл в top' : x.stage === 'sim' ? 'косинус' : 'реранкер' }),
+          ' ', h('span', { class: 'muted small', text: x.reason }))));
+    });
+    box.appendChild(tbl);
+  }
+
+  function renderExpected() {
+    var box = clear($('ask-expected'));
+    if (!askQuestion) return;
+    box.appendChild(h('div', { class: 'expected' }, h('b', { text: 'ожидание' }), askQuestion.expected,
+      h('div', { class: 'muted small', style: 'margin-top:4px', text: 'источник: ' + (askQuestion.chapters.length ? askQuestion.sources.join(', ') : 'нет — правильный ответ «в книге этого нет»') })));
+  }
+
+  function runAsk() {
+    var q = $('ask-q').value.trim();
+    if (!q) return;
+    if (askQuestion && askQuestion.q !== q) askQuestion = null;
+    document.querySelectorAll('#ask-examples .chip').forEach(function (c) { c.classList.toggle('on', !!askQuestion && c.textContent === askQuestion.q); });
+    renderExpected();
+    var ans = clear($('answers'));
+    ['plain', 'rag', 'rag2'].forEach(function (k) { ans.appendChild(answerPanel(k, null)); });
+    $('ask-sources').hidden = true;
+    $('ask-funnel').hidden = true;
+    $('ask-btn').disabled = true;
+    api('/api/ask', { q: q, model: models.current, k: +$('ask-k').value, params: tuneParams() }).then(function (r) {
+      clear(ans);
+      ['plain', 'rag', 'rag2'].forEach(function (k) { ans.appendChild(answerPanel(k, r[k])); });
+      renderFunnel(r.rag2);
+      renderSources(r.rag);
+    }).catch(function (e) {
+      clear(ans).appendChild(h('div', { class: 'empty', text: e.message }));
+    }).finally(function () { $('ask-btn').disabled = false; });
+  }
+  $('ask-form').addEventListener('submit', function (e) { e.preventDefault(); runAsk(); });
+
+  function loadRagQuestions() {
+    if (ragQuestions.length) return Promise.resolve(ragQuestions);
+    return api('/api/rag/questions').then(function (d) { ragQuestions = d.questions; return ragQuestions; });
+  }
+
+  loaders.ask = function () {
+    renderFlow();
+    Promise.all([loadModels(), loadRagQuestions(), loadTune()]).then(function () {
+      var box = clear($('ask-examples'));
+      ragQuestions.forEach(function (q) {
+        box.appendChild(h('button', { class: 'chip', type: 'button', text: q.q, onclick: function () { askQuestion = q; $('ask-q').value = q.q; runAsk(); } }));
+      });
+    });
+    $('ask-q').focus();
+  };
+
+  // ═════════════ 06 КАЧЕСТВО ═════════════
+  var evalAfter = 0, evalPoll = null;
+
+  function yesNo(v) { return v ? h('span', { class: 'verdict v-верно', text: 'да' }) : h('span', { class: 'verdict v-неверно', text: 'нет' }); }
+
+  function verdictChip(v) { return h('span', { class: 'verdict v-' + (v || 'none'), text: v || '—' }); }
+
+  function stack(t, n) {
+    var box = h('div', { class: 'stack' });
+    [['верно', 's1'], ['частично', 's2'], ['неверно', 's3']].forEach(function (x) {
+      if (t[x[0]]) box.appendChild(h('i', { class: x[1], style: 'width:' + (t[x[0]] / n * 100) + '%', title: x[0] + ': ' + t[x[0]] }));
+    });
+    return box;
+  }
+
+  function renderTotals(res) {
+    var box = clear($('q-totals'));
+    $('q-model').textContent = res ? res.model + ' · судья ' + res.judge + ' · ' + new Date(res.finished * 1000).toLocaleString('ru-RU') : '';
+    if (!res) { box.appendChild(h('div', { class: 'empty', text: 'Для этой модели прогона ещё нет — нажмите «Запустить прогон».' })); return; }
+    var t = res.totals, n = t.questions;
+    box.appendChild(h('div', { class: 'score' },
+      h('div', { class: 'score__card p' }, h('div', { class: 'stat__k', text: 'без RAG — верно' }), h('div', { class: 'score__big', text: t.plain['верно'] + ' / ' + n }),
+        stack(t.plain, n), h('div', { class: 'muted small', text: 'частично ' + t.plain['частично'] + ' · неверно ' + t.plain['неверно'] })),
+      h('div', { class: 'score__card r' }, h('div', { class: 'stat__k', text: 'RAG — верно' }), h('div', { class: 'score__big', text: t.rag['верно'] + ' / ' + n }),
+        stack(t.rag, n), h('div', { class: 'muted small', text: 'частично ' + t.rag['частично'] + ' · неверно ' + t.rag['неверно'] })),
+      t.rag2 ? h('div', { class: 'score__card g' }, h('div', { class: 'stat__k', text: 'RAG + rerank — верно' }), h('div', { class: 'score__big', text: t.rag2['верно'] + ' / ' + n }),
+        stack(t.rag2, n), h('div', { class: 'muted small', text: 'частично ' + t.rag2['частично'] + ' · неверно ' + t.rag2['неверно'] })) : null,
+      h('div', { class: 'score__card s' }, h('div', { class: 'stat__k', text: 'нужная глава в отрывках' }),
+        h('div', { class: 'score__big', text: t.chapter_hit + (t.chapter_hit2 != null ? ' → ' + t.chapter_hit2 : '') + ' / ' + t.with_source }),
+        h('div', { class: 'muted small', text: 'RAG → RAG + rerank; проверка кодом, без судьи; ловушка не считается' }))));
+    if (res.params2) {
+      var p = res.params2;
+      box.appendChild(h('div', { class: 'muted small mono', style: 'margin-top:8px', text: 'воронка RAG + rerank: ' + p.query + ' · top-' + p.k_before +
+        ' → cos ≥ ' + p.sim_min + (p.rerank ? ' → реранкер ≥ ' + p.rel_min : '') + ' → top-' + p.k_after }));
+    }
+  }
+
+  function renderQTable(res) {
+    var box = clear($('q-table'));
+    var tbl = h('table', { class: 't qa' }, h('tr', null, h('th', { text: 'вопрос' }), h('th', { text: 'ожидание · источник' }),
+      h('th', { style: 'color:var(--plain)', text: 'без RAG' }), h('th', { style: 'color:var(--structure)', text: 'RAG' }),
+      h('th', { style: 'color:var(--rr)', text: 'RAG + rerank' }), h('th', { text: 'глава в отрывках' })));
+    ragQuestions.forEach(function (q) {
+      var it = res && res.items[q.id];
+      function cell(mode) {
+        var a = it && it[mode];
+        if (!a) return h('td', { class: 'ans muted', text: '—' });
+        return h('td', { class: 'ans' }, verdictChip(a.verdict), ' ', a.error ? h('span', { class: 'flag warn', text: a.error }) : a.text,
+          a.reason ? h('div', { class: 'reason', text: 'судья: ' + a.reason }) : null);
+      }
+      tbl.appendChild(h('tr', null,
+        h('td', null, q.q, q.verified ? null : h('div', { class: 'flag warn', text: 'не подтверждён текстом' })),
+        h('td', { class: 'exp' }, q.expected, h('div', { class: 'muted small', style: 'margin-top:4px', text: q.chapters.length ? q.sources.join(', ') : 'источника нет (ловушка)' })),
+        cell('plain'), cell('rag'), cell('rag2'),
+        h('td', { class: 'num' }, !it || it.chapter_hit == null ? '—' : [yesNo(it.chapter_hit), it.chapter_hit2 != null ? [' → ', yesNo(it.chapter_hit2)] : null,
+          it.rag2 && it.rag2.counts ? h('div', { class: 'muted small', text: 'отрывков ' + it.rag2.counts.kept }) : null],
+          it && it.chapter_hit == null && it.rag2 && it.rag2.counts ? h('div', { class: 'muted small', text: 'отрывков ' + it.rag2.counts.kept }) : null)));
+    });
+    box.appendChild(tbl);
+  }
+
+  function showResult(model) {
+    return api('/api/rag/results?model=' + encodeURIComponent(model)).then(function (d) {
+      renderTotals(d.result); renderQTable(d.result);
+      document.querySelectorAll('.run').forEach(function (r) { r.classList.toggle('on', r.dataset.model === model); });
+    });
+  }
+
+  function loadRuns() {
+    return api('/api/rag/results').then(function (d) {
+      var box = clear($('runs'));
+      if (!d.runs.length) box.appendChild(h('div', { class: 'muted small', text: 'Прогонов пока нет.' }));
+      d.runs.forEach(function (r) {
+        var t = r.totals;
+        box.appendChild(h('div', { class: 'run', 'data-model': r.model, onclick: function () { showResult(r.model); } },
+          h('div', null, r.model, h('br'), h('small', { text: 'судья ' + r.judge })),
+          h('div', { style: 'text-align:right' }, h('span', { style: 'color:var(--plain)', text: t.plain['верно'] }), ' → ',
+            h('span', { style: 'color:var(--structure)', text: t.rag['верно'] }),
+            t.rag2 ? [' → ', h('span', { style: 'color:var(--rr)', text: t.rag2['верно'] })] : null, h('small', { text: ' из ' + t.questions }))));
+      });
+      return showResult(models.current);
+    });
+  }
+
+  function pollEval() {
+    api('/api/rag/eval/status?after=' + evalAfter).then(function (s) {
+      var con = $('eval-console');
+      if (evalAfter === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      evalAfter += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('eval-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') { showResult(models.current); return; }
+      clearInterval(evalPoll); evalPoll = null;
+      $('btn-eval').disabled = false;
+      if (s.state === 'done') $('eval-bar').style.width = '100%';
+      loadRuns();
+    }).catch(function () {});
+  }
+
+  $('btn-eval').addEventListener('click', function () {
+    evalAfter = 0;
+    clear($('eval-console'));
+    $('eval-bar').style.width = '2%';
+    api('/api/rag/eval', { model: models.current, judge: $('judge-select').value, force: $('eval-force').checked }).then(function (r) {
+      if (!r.started) { alert('Прогон уже идёт'); }
+      $('btn-eval').disabled = true;
+      if (!evalPoll) evalPoll = setInterval(pollEval, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.quality = function () {
+    Promise.all([loadModels(), loadRagQuestions()]).then(function () {
+      $('eval-model').textContent = models.current;
+      loadRuns();
+      api('/api/rag/eval/status?after=0').then(function (s) { if (s.state === 'running' && !evalPoll) { $('btn-eval').disabled = true; evalPoll = setInterval(pollEval, 1500); } });
+    });
+  };
+
+  // ═════════════ 07 РЕРАНКИНГ ═════════════
+  var rrReport = null, rrAfter = 0, rrPoll = null;
+  var QM = { raw: 'вопрос как есть', en: 'перевод (en)', hyde: 'HyDE' };
+
+  // та же воронка, что rerank.funnel на сервере, — по сохранённым кандидатам
+  function rrApply(cands, cfg) {
+    var pool = cands.slice(0, cfg.k_before).filter(function (c) { return c.cos >= cfg.sim_min; });
+    if (cfg.rerank) {
+      pool = pool.filter(function (c) { return c.rel >= cfg.rel_min; });
+      pool = pool.slice().sort(function (a, b) { return b.rel - a.rel; });
+    }
+    return pool.slice(0, cfg.k_after);
+  }
+
+  function rrMetrics(data, cfg) {
+    var ans = data.filter(function (d) { return d.chapters.length; }), no = data.filter(function (d) { return !d.chapters.length; });
+    var m = { hit1: 0, hitk: 0, prec: 0, kept: 0, empty: 0 };
+    ans.forEach(function (d) {
+      var kept = rrApply(d.modes[cfg.query], cfg);
+      var ok = function (c) { return c.chapters.some(function (n) { return d.chapters.indexOf(n) !== -1; }); };
+      var good = kept.filter(ok);
+      m.hit1 += kept.length && ok(kept[0]) ? 1 : 0;
+      m.hitk += good.length ? 1 : 0;
+      m.prec += kept.length ? good.length / kept.length : 0;
+      m.kept += kept.length;
+      m.empty += kept.length ? 0 : 1;
+    });
+    Object.keys(m).forEach(function (k) { m[k] = m[k] / (ans.length || 1); });
+    var nk = no.map(function (d) { return rrApply(d.modes[cfg.query], cfg).length; });
+    m.no_empty = nk.filter(function (x) { return !x; }).length / (nk.length || 1);
+    m.no_kept = nk.reduce(function (a, b) { return a + b; }, 0) / (nk.length || 1);
+    return m;
+  }
+
+  var RR_COLS = [['hit1', 'hit@1', pct, 1], ['hitk', 'hit@K', pct, 1], ['prec', 'точность контекста', pct, 1],
+    ['kept', 'отрывков в модель', function (x) { return x.toFixed(1); }, 0], ['empty', 'пустой контекст (с ответом)', pct, -1],
+    ['no_empty', 'пустой контекст (без ответа)', pct, 1], ['no_kept', 'отрывков (без ответа)', function (x) { return x.toFixed(1); }, -1]];
+
+  function rrTable(rows, bestId) {
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'режим' }), RR_COLS.map(function (c) { return h('th', { style: 'text-align:right', text: c[1] }); })));
+    var best = {};
+    RR_COLS.forEach(function (c) {
+      if (!c[3]) return;
+      var vals = rows.map(function (r) { return r[c[0]]; });
+      best[c[0]] = c[3] > 0 ? Math.max.apply(null, vals) : Math.min.apply(null, vals);
+    });
+    rows.forEach(function (r) {
+      tbl.appendChild(h('tr', { class: r.id === bestId ? 'best' : '' }, h('td', null, r.title, r.cfg ? h('div', { class: 'muted small mono', text: cfgText(r.cfg) }) : null),
+        RR_COLS.map(function (c) { return h('td', { class: 'num' + (c[3] && r[c[0]] === best[c[0]] ? ' win' : ''), text: c[2](r[c[0]]) }); })));
+    });
+    return tbl;
+  }
+
+  function cfgText(c) {
+    return c.query + ' · top-' + c.k_before + (c.sim_min > -1 ? ' → cos ≥ ' + c.sim_min : '') + (c.rerank ? ' → rel ≥ ' + c.rel_min : '') + ' → top-' + c.k_after;
+  }
+
+  function rrSweepChart(query) {
+    var data = rrReport.questions, W = 560, H = 230, pad = 34, els = [];
+    var pts = [];
+    for (var i = 0; i < 20; i++) {
+      var t = Math.round(i * 5) / 100;
+      pts.push({ t: t, m: rrMetrics(data, { query: query, rerank: true, k_before: 20, sim_min: -1, rel_min: t, k_after: 5 }) });
+    }
+    var x = function (t) { return pad + t / 0.95 * (W - pad * 2); }, y = function (v) { return H - pad - v * (H - pad - 14); };
+    [0, .25, .5, .75, 1].forEach(function (v) {
+      els.push(sv('line', { x1: pad, x2: W - pad, y1: y(v), y2: y(v), stroke: cssVar('--line'), 'stroke-dasharray': v ? '2 4' : '' }));
+      els.push(sv('text', { x: pad - 6, y: y(v) + 3, 'text-anchor': 'end' }, Math.round(v * 100)));
+    });
+    [0, .2, .4, .6, .8].forEach(function (t) { els.push(sv('text', { x: x(t), y: H - 12, 'text-anchor': 'middle' }, t.toFixed(1))); });
+    els.push(sv('text', { x: W - pad, y: H - 12, 'text-anchor': 'end' }, 'порог реранкера →'));
+    var lines = [['hitk', cssVar('--structure'), 'hit@K'], ['prec', cssVar('--rr'), 'точность'], ['no_empty', cssVar('--plain'), 'пусто на «нет ответа»'], ['empty', cssVar('--err'), 'пусто на вопросах с ответом']];
+    lines.forEach(function (l, li) {
+      els.push(sv('polyline', { points: pts.map(function (p) { return x(p.t) + ',' + y(p.m[l[0]]); }).join(' '), fill: 'none', stroke: l[1], 'stroke-width': 2 }));
+      pts.forEach(function (p) {
+        var c = sv('circle', { cx: x(p.t), cy: y(p.m[l[0]]), r: 2.5, fill: l[1] });
+        c.appendChild(sv('title', {}, l[2] + ' при пороге ' + p.t + ': ' + Math.round(p.m[l[0]] * 100) + '%'));
+        els.push(c);
+      });
+      els.push(sv('rect', { x: pad + li * 128, y: 0, width: 10, height: 4, fill: l[1] }));
+      els.push(sv('text', { x: pad + li * 128 + 14, y: 6 }, l[2]));
+    });
+    var cur = +$('rl-rel_min').value;
+    els.push(sv('line', { x1: x(cur), x2: x(cur), y1: 12, y2: H - pad, stroke: cssVar('--text'), 'stroke-dasharray': '3 3' }));
+    var rec = rrReport.recommended;
+    if (rec.query === query) els.push(sv('line', { x1: x(rec.rel_min), x2: x(rec.rel_min), y1: 12, y2: H - pad, stroke: cssVar('--rr'), 'stroke-width': 1, opacity: .6 }));
+    return h('div', null, svg(W, H, els), h('div', { class: 'muted small', text: 'Режим запроса: ' + QM[query] + ', top-20 → реранкер → top-5. Пунктир — текущий порог, зелёная линия — рекомендованный.' }));
+  }
+
+  function rrLiveCfg() {
+    var c = { query: $('rl-query').value, rerank: $('rl-rerank').checked, k_before: +$('rl-k_before').value,
+      sim_min: +$('rl-sim_min').value, rel_min: +$('rl-rel_min').value, k_after: +$('rl-k_after').value };
+    ['k_before', 'sim_min', 'rel_min', 'k_after'].forEach(function (k) { $('rv-' + k).textContent = c[k]; });
+    return c;
+  }
+
+  function rrRenderLive() {
+    var cfg = rrLiveCfg();
+    var m = rrMetrics(rrReport.questions, cfg);
+    var base = rrReport.summary.filter(function (r) { return r.id === 'base'; })[0];
+    clear($('rr-live-out')).appendChild(rrTable([
+      Object.assign({ id: 'base', title: 'Базовый (День 22)', cfg: base.cfg }, base),
+      Object.assign({ id: 'live', title: 'Ваши настройки', cfg: cfg }, m)], 'live'));
+    clear($('rr-sweep')).appendChild(rrSweepChart(cfg.rerank ? cfg.query : rrReport.recommended.query));
+    rrNoAnswer(cfg);
+  }
+
+  function rrNoAnswer(cfg) {
+    var box = clear($('rr-noans'));
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'вопрос' }), h('th', { style: 'text-align:right', text: 'базовый: отрывков' }),
+      h('th', { style: 'text-align:right', text: 'ваши настройки: отрывков' }), h('th', { text: 'что всё же прошло (оценка реранкера)' })));
+    rrReport.questions.filter(function (d) { return !d.chapters.length; }).forEach(function (d) {
+      var kept = rrApply(d.modes[cfg.query], cfg);
+      tbl.appendChild(h('tr', null, h('td', { text: d.q }), h('td', { class: 'num', text: 5 }),
+        h('td', { class: 'num' }, kept.length ? String(kept.length) : h('span', { class: 'verdict v-верно', text: '0 — честный отказ' })),
+        h('td', { class: 'muted small', text: kept.map(function (c) { return c.section + ' (' + c.rel.toFixed(2) + ')'; }).join('; ') })));
+    });
+    box.appendChild(tbl);
+  }
+
+  function rrBuildLive() {
+    var rec = rrReport.recommended;
+    var box = clear($('rr-live'));
+    var sel = h('select', { id: 'rl-query' }, ['raw', 'en', 'hyde'].map(function (q) { return h('option', { value: q, text: QM[q] }); }));
+    box.appendChild(h('div', { class: 'live' },
+      h('label', null, 'запрос', sel),
+      h('label', null, h('span', null, 'top-K до ', h('b', { id: 'rv-k_before' })), h('input', { type: 'range', id: 'rl-k_before', min: 5, max: 20, step: 1, value: 20 })),
+      h('label', null, h('span', null, 'порог косинуса ', h('b', { id: 'rv-sim_min' })), h('input', { type: 'range', id: 'rl-sim_min', min: 0, max: 0.6, step: 0.01, value: rec.sim_min > 0 ? rec.sim_min : 0 })),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'rl-rerank', checked: 'checked' }), 'реранкер'),
+      h('label', null, h('span', null, 'порог реранкера ', h('b', { id: 'rv-rel_min' })), h('input', { type: 'range', id: 'rl-rel_min', min: 0, max: 0.95, step: 0.05, value: rec.rel_min })),
+      h('label', null, h('span', null, 'top-K после ', h('b', { id: 'rv-k_after' })), h('input', { type: 'range', id: 'rl-k_after', min: 1, max: 10, step: 1, value: 5 }))));
+    box.appendChild(h('div', { id: 'rr-live-out' }));
+    box.appendChild(h('div', { class: 'controls', style: 'margin-top:10px' }, h('button', { class: 'btn', type: 'button', text: 'использовать в «Вопрос · RAG» →', onclick: function () {
+      var c = rrLiveCfg(); loadTune().then(function () { setTune(c); show('ask'); });
+    } })));
+    sel.value = rec.query;
+    box.querySelectorAll('input, select').forEach(function (e) { e.addEventListener('input', rrRenderLive); });
+    rrRenderLive();
+  }
+
+  function rrRender() {
+    var r = rrReport;
+    if (!r) { clear($('rr-table')).appendChild(h('div', { class: 'empty', text: 'Эксперимента ещё нет — нажмите «Запустить эксперимент» (≈10 минут на GTX 1050 Ti).' })); return; }
+    $('rr-meta').textContent = new Date(r.finished * 1000).toLocaleString('ru-RU') + ' · ' + r.seconds + ' с · реранкер ' + r.rerank_model;
+    clear($('rr-rec')).appendChild(kv([['запрос', QM[r.recommended.query]], ['порог косинуса', r.recommended.sim_min > -1 ? r.recommended.sim_min : 'нет'], ['порог реранкера', r.recommended.rel_min],
+      ['top-K до → после', r.k_pool + ' → 5'], ['вопросов', r.questions.length + ' (без ответа: ' + r.questions.filter(function (d) { return !d.chapters.length; }).length + ')'],
+      ['rewrite', r.rewrite_model]]));
+    $('rr-thr').textContent = 'пороги в режимах с фильтром: косинус ≥ ' + r.recommended.sim_min + ', реранкер ≥ ' + r.recommended.rel_min;
+    var bestId = r.recommended.query === 'raw' ? 'filter' : r.recommended.query + '-filter';
+    clear($('rr-table')).appendChild(rrTable(r.summary, bestId));
+    rrBuildLive();
+  }
+
+  function rrLoad() {
+    return api('/api/experiment/report').then(function (d) { rrReport = d.report; rrRender(); });
+  }
+
+  function rrPollFn() {
+    api('/api/experiment/status?after=' + rrAfter).then(function (s) {
+      var con = $('rr-console');
+      if (rrAfter === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      rrAfter += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('rr-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') return;
+      clearInterval(rrPoll); rrPoll = null;
+      $('btn-rr').disabled = false;
+      if (s.state === 'done') { $('rr-bar').style.width = '100%'; rrLoad(); }
+    }).catch(function () {});
+  }
+
+  $('btn-rr').addEventListener('click', function () {
+    rrAfter = 0; clear($('rr-console'));
+    api('/api/experiment', { model: models.current }).then(function (r) {
+      $('btn-rr').disabled = true;
+      if (!rrPoll) rrPoll = setInterval(rrPollFn, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.rerank = function () {
+    var box = clear($('rr-flow'));
+    [['r', 'вопрос'], ['', '→'], ['g', 'rewrite: raw / en / HyDE'], ['', '→'], ['r', 'bge-m3: top-20'], ['', '→'], ['g', 'фильтр: косинус ≥ порог'], ['', '→'],
+     ['g', 'Qwen3-Reranker: P(yes)'], ['', '→'], ['g', 'фильтр: оценка ≥ порог'], ['', '→'], ['r', 'top-5 → LLM']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' ? h('i', { text: '→' }) : h('span', { class: x[0], text: x[1] })); });
+    loadModels().then(function () { $('rr-model').textContent = models.current; });
+    rrLoad();
+    api('/api/experiment/status?after=0').then(function (s) { if (s.state === 'running' && !rrPoll) { $('btn-rr').disabled = true; rrPoll = setInterval(rrPollFn, 1500); } });
+  };
+
+  // ═════════════ 08 ЦИТАТЫ ═════════════
+  var ct = { config: null, after: 0, poll: null, question: null };
+  var BY = { gate: 'порог уверенности (до LLM)', model: 'модель сама сказала «нет ответа»',
+    verify: 'нет ни одной подтверждённой цитаты', meaning: 'цитаты не подтверждают смысл ответа' };
+  var QST = { exact: ['дословно', 'ok'], fuzzy: ['почти дословно → заменена текстом', 'warn'], moved: ['найдена в другом отрывке → источник исправлен', 'warn'], rejected: ['отклонена', 'bad'] };
+
+  function ctFlow() {
+    var box = clear($('ct-flow'));
+    [['g', 'воронка Дня 23'], ['', '→'], ['c', 'порог уверенности → «не знаю»'], ['', '→'], ['r', 'LLM: JSON {status, answer [n], quotes, clarify}'], ['', '→'],
+     ['c', 'цитаты ищутся в отрывках'], ['', '→'], ['c', 'источники строит код'], ['', '→'], ['c', 'смысл ответа ↔ цитаты'], ['', '→'], ['g', 'ответ или «не знаю»']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' ? h('i', { text: '→' }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  function chk(ok, text, warn) { return h('span', { class: 'chk ' + (ok ? 'ok' : warn ? 'warn' : 'bad'), text: (ok ? '✓ ' : warn ? '~ ' : '✗ ') + text }); }
+
+  function quoteCard(q, a) {
+    var src = (a.context || []).filter(function (s) { return s.n === q.source; })[0];
+    var st = QST[q.status] || ['?', ''];
+    var card = h('div', { class: 'quote' + (q.status === 'rejected' ? ' rejected' : '') },
+      h('div', { class: 'quote__text', text: '«' + (q.quote || q.quote_model) + '»' }),
+      h('div', { class: 'quote__meta' },
+        q.source ? h('span', { class: 'cite', text: q.source }) : null,
+        h('span', { text: q.section || (src && src.section) || '' }), h('span', { text: q.chunk_id || '' }),
+        h('span', { class: 'chk ' + st[1], text: st[0] + (q.status === 'fuzzy' ? ' (' + Math.round(q.ratio * 100) + '%)' : '') }),
+        q.status === 'rejected' ? h('span', { text: q.reason || '' }) : null,
+        q.status !== 'fuzzy' && q.status !== 'moved' || !q.quote_model || q.quote_model === q.quote ? null : h('span', { title: q.quote_model, text: 'у модели было: «' + q.quote_model.slice(0, 60) + '…»' })));
+    if (src && q.start != null) {
+      var ctx = h('div', { class: 'qctx' });
+      var from = Math.max(0, q.start - 300), to = Math.min(src.text.length, q.end + 300);
+      ctx.appendChild(document.createTextNode((from ? '…' : '') + src.text.slice(from, q.start)));
+      ctx.appendChild(h('mark', { text: src.text.slice(q.start, q.end) }));
+      ctx.appendChild(document.createTextNode(src.text.slice(q.end, to) + (to < src.text.length ? '…' : '')));
+      card.appendChild(ctx);
+      card.title = 'клик — показать цитату в тексте отрывка';
+      card.addEventListener('click', function () { card.classList.toggle('open'); });
+    }
+    return card;
+  }
+
+  function ctRender(a) {
+    var box = clear($('ct-result'));
+    var p = h('div', { class: 'panel' });
+    var answered = a.status !== 'unknown';
+    var js = a.judge_support;
+    p.appendChild(h('div', { class: 'verdictbar' },
+      h('span', { class: 'status ' + a.status, text: a.status === 'answered' ? 'ОТВЕТ С ДОКАЗАТЕЛЬСТВАМИ' : a.status === 'quotes' ? 'ОТВЕТ ЦИТАТАМИ' : 'НЕ ЗНАЮ' }),
+      a.status === 'answered' ? null : h('span', { class: 'muted small mono', text: 'причина: ' + BY[a.by] + (a.quote_rel != null ? ' · цитаты отвечают на вопрос: ' + a.quote_rel.toFixed(2) : '') }),
+      h('div', { class: 'checks' },
+        chk(a.sources.length, 'источники: ' + a.sources.length),
+        chk(a.quotes.length, 'цитаты: ' + a.quotes.length + (a.rejected.length ? ' (+' + a.rejected.length + ' отклонено)' : '')),
+        js ? chk(js.verdict === 'да', 'смысл ↔ цитаты: ' + js.verdict, js.verdict === 'частично') : null,
+        a.support != null ? chk(a.support_ok, 'по теме (реранкер): ' + a.support.toFixed(2)) : null,
+        chk(a.best_rel >= a.gate_min, 'уверенность ' + a.best_rel.toFixed(2) + ' / порог ' + a.gate_min)),
+      h('span', { class: 'muted small mono', style: 'margin-left:auto', text: (a.latency_ms / 1000).toFixed(1) + ' с' })));
+    p.appendChild(a.status === 'answered' ? withCites(a.answer, function (n) {
+      var el = document.querySelector('#ct-result .cite-src[data-n="' + n + '"]'); if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    }) : h('div', { class: 'ct-answer', text: a.answer }));
+    if (a.status === 'answered') p.lastChild.classList.add('ct-answer');
+    if (a.unverified_answer) p.appendChild(h('div', { class: 'ct-unver' }, h('b', { text: 'НЕ ВЫДАН — ответ модели: ' }), a.unverified_answer));
+    if (js && js.reason) p.appendChild(h('div', { class: 'muted small', style: 'margin-bottom:10px', text: 'судья: ' + js.reason }));
+    if (a.clarify) p.appendChild(h('div', { class: 'expected' }, h('b', { text: 'уточните' }), a.clarify));
+    if (!answered && a.clarify_hints && a.clarify_hints.length) {
+      p.appendChild(h('div', { class: 'muted small', text: 'Похоже, вопрос о главах:' }));
+      p.appendChild(h('div', { class: 'ct-hints' }, a.clarify_hints.map(function (s) { return h('span', { class: 'chip', text: s }); })));
+    }
+    box.appendChild(p);
+    if (a.sources.length) {
+      var t = h('table', { class: 't srcs' }, h('tr', null, h('th', { text: '[n]' }), h('th', { text: 'source' }), h('th', { text: 'section' }), h('th', { text: 'chunk_id' }), h('th', { text: 'реранкер' })));
+      a.sources.forEach(function (s) {
+        t.appendChild(h('tr', { class: 'cite-src', 'data-n': s.n }, h('td', null, h('span', { class: 'cite', text: s.n })), h('td', { class: 'mono', text: s.source }),
+          h('td', { text: s.section }), h('td', { class: 'mono', text: s.chunk_id }), h('td', { class: 'num', text: s.rel == null ? '—' : s.rel.toFixed(2) })));
+      });
+      box.appendChild(h('div', { class: 'panel' }, h('div', { class: 'panel__title', text: 'Источники (собраны кодом по подтверждённым цитатам и ссылкам [n])' }), t));
+    }
+    var qs = a.quotes.concat(a.rejected);
+    if (qs.length) {
+      box.appendChild(h('div', { class: 'panel' }, h('div', { class: 'panel__title', text: 'Цитаты — проверены по тексту отрывков (клик — показать в контексте)' }),
+        qs.map(function (q) { return quoteCard(q, a); })));
+    }
+  }
+
+  function ctAsk() {
+    var q = $('ct-q').value.trim();
+    if (!q) return;
+    if (ct.question && ct.question.q !== q) ct.question = null;
+    var ex = clear($('ct-expected'));
+    if (ct.question) ex.appendChild(h('div', { class: 'expected' }, h('b', { text: 'ожидание' }), ct.question.expected,
+      h('div', { class: 'muted small', style: 'margin-top:4px', text: 'источник: ' + (ct.question.chapters.length ? ct.question.sources.join(', ') : 'нет — правильно ответить «не знаю»') })));
+    clear($('ct-result')).appendChild(h('div', { class: 'panel thinking', text: 'ищу, отвечаю, проверяю цитаты' }));
+    $('ct-btn').disabled = true;
+    api('/api/cite/ask', { q: q, model: models.current, judge: $('ct-judge').value, params: tuneParams ? (rr.config ? tuneParams() : null) : null, gate_min: +$('ct-gate').value })
+      .then(ctRender).catch(function (e) { clear($('ct-result')).appendChild(h('div', { class: 'empty', text: e.message })); })
+      .finally(function () { $('ct-btn').disabled = false; });
+  }
+  $('ct-form').addEventListener('submit', function (e) { e.preventDefault(); ctAsk(); });
+
+  // ── проверка на 10 вопросах ──
+  function ctTotals(r) {
+    var box = clear($('ct-totals'));
+    $('ct-run-meta').textContent = r ? r.model + ' · судья ' + r.judge + ' · порог «не знаю» ' + r.gate_min + ' · ' + new Date(r.finished * 1000).toLocaleString('ru-RU') : '';
+    if (!r) { box.appendChild(h('div', { class: 'empty', text: 'Проверки для этой модели ещё нет — нажмите «Запустить проверку».' })); return; }
+    var t = r.totals;
+    function card(cls, k, big, sub) { return h('div', { class: 'score__card ' + cls }, h('div', { class: 'stat__k', text: k }), h('div', { class: 'score__big', text: big }), h('div', { class: 'muted small', text: sub })); }
+    box.appendChild(h('div', { class: 'score' },
+      card('g', 'ответов с источниками', t.with_sources + ' / ' + t.answered, 'по существу ' + (t.answered - (t.quote_answers || 0)) + ', цитатами ' + (t.quote_answers || 0) + '; «не знаю»: ' + t.unknown),
+      card('g', 'ответов с цитатами', t.with_quotes + ' / ' + t.answered, 'подтверждено цитат ' + t.quotes_ok + ' из ' + t.quotes + ', дословно ' + t.quotes_exact),
+      card('r', 'смысл ↔ цитаты (судья)', t.judge_support['да'] + ' / ' + t.answered, 'частично ' + t.judge_support['частично'] + ' · нет ' + t.judge_support['нет'] + '; отклонено по смыслу ' + t.meaning_rejected),
+      card('s', 'верно по эталону', t.correct['верно'] + ' / ' + t.questions, 'частично ' + t.correct['частично'] + ' · неверно ' + t.correct['неверно']),
+      card('p', '«не знаю» на ловушке', t.trap_unknown + ' / ' + t.traps, 'лишних «не знаю» на вопросах с ответом: ' + t.false_unknown)));
+  }
+
+  function ctTable(r) {
+    var box = clear($('ct-table'));
+    if (!r) return;
+    var tbl = h('table', { class: 't qa' }, h('tr', null, h('th', { text: 'вопрос · ожидание' }), h('th', { text: 'ответ' }), h('th', { text: 'источники' }),
+      h('th', { text: 'цитаты' }), h('th', { text: 'смысл ↔ цитаты' }), h('th', { text: 'верно?' })));
+    Object.keys(r.items).forEach(function (id) {
+      var v = r.items[id], js = v.judge_support;
+      tbl.appendChild(h('tr', null,
+        h('td', { class: 'exp' }, v.q, h('div', { class: 'muted small', style: 'margin-top:4px', text: v.expected })),
+        h('td', { class: 'ans' }, h('span', { class: 'status ' + v.status, style: 'font-size:10.5px;padding:1px 6px', text: v.status === 'answered' ? 'ответ' : v.status === 'quotes' ? 'цитатами' : 'не знаю' }), ' ',
+          v.answer, v.status !== 'answered' ? h('div', { class: 'reason', text: BY[v.by] }) : null,
+          v.unverified_answer ? h('div', { class: 'reason', text: 'не выдан: ' + v.unverified_answer }) : null),
+        h('td', { class: 'small' }, v.sources.length ? v.sources.map(function (s) { return h('div', { text: '[' + s.n + '] ' + s.section }); }) : '—'),
+        h('td', { class: 'small' }, v.quotes.length + v.rejected.length ? [h('div', { text: v.quotes.length + ' подтв. / ' + v.rejected.length + ' откл.' }),
+          v.quotes.slice(0, 1).map(function (q) { return h('div', { class: 'muted', style: 'font-style:italic', text: '«' + q.quote.slice(0, 90) + '…»' }); })] : '—'),
+        h('td', null, js ? [h('span', { class: 'verdict ' + (js.verdict === 'да' ? 'v-верно' : js.verdict === 'частично' ? 'v-частично' : 'v-неверно'), text: js.verdict }),
+          h('div', { class: 'reason', text: js.reason })] : '—'),
+        h('td', null, verdictChip(v.judge_correct && v.judge_correct.verdict))));
+    });
+    box.appendChild(tbl);
+  }
+
+  function ctShow(model) {
+    return api('/api/cite/results?model=' + encodeURIComponent(model)).then(function (d) {
+      ctTotals(d.result); ctTable(d.result);
+      document.querySelectorAll('#ct-runs .run').forEach(function (r) { r.classList.toggle('on', r.dataset.model === model); });
+    });
+  }
+
+  function ctRuns() {
+    return api('/api/cite/results').then(function (d) {
+      var box = clear($('ct-runs'));
+      if (!d.runs.length) box.appendChild(h('div', { class: 'muted small', text: 'Проверок пока нет.' }));
+      d.runs.forEach(function (r) {
+        var t = r.totals;
+        box.appendChild(h('div', { class: 'run', 'data-model': r.model, onclick: function () { ctShow(r.model); } },
+          h('div', null, r.model, h('br'), h('small', { text: 'судья ' + r.judge })),
+          h('div', { style: 'text-align:right' }, h('span', { style: 'color:var(--rr)', text: t.with_quotes + '/' + t.answered }), h('small', { text: ' с цитатами' }))));
+      });
+      return ctShow(models.current);
+    });
+  }
+
+  function ctPoll() {
+    api('/api/cite/eval/status?after=' + ct.after).then(function (s) {
+      var con = $('ct-console');
+      if (ct.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      ct.after += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('ct-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') { ctShow(models.current); return; }
+      clearInterval(ct.poll); ct.poll = null;
+      $('btn-ct-eval').disabled = false;
+      if (s.state === 'done') $('ct-bar').style.width = '100%';
+      ctRuns();
+    }).catch(function () {});
+  }
+
+  $('btn-ct-eval').addEventListener('click', function () {
+    ct.after = 0; clear($('ct-console')); $('ct-bar').style.width = '2%';
+    api('/api/cite/eval', { model: models.current, judge: $('ct-judge').value, gate_min: +$('ct-gate').value }).then(function () {
+      $('btn-ct-eval').disabled = true;
+      if (!ct.poll) ct.poll = setInterval(ctPoll, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.cite = function () {
+    ctFlow();
+    Promise.all([loadModels(), loadRagQuestions(), loadTune(),
+      ct.config ? Promise.resolve(ct.config) : api('/api/cite/config').then(function (c) { ct.config = c; $('ct-gate').value = c.gate_min; return c; })
+    ]).then(function () {
+      $('ct-model').textContent = models.current;
+      if (!$('ct-judge').options.length) fillModelSelect($('ct-judge'), lsGet('judge') || models.current);
+      var box = clear($('ct-examples'));
+      ragQuestions.forEach(function (q) {
+        box.appendChild(h('button', { class: 'chip', type: 'button', text: q.q, onclick: function () { ct.question = q; $('ct-q').value = q.q; ctAsk(); } }));
+      });
+      ctRuns();
+      api('/api/cite/eval/status?after=0').then(function (s) { if (s.state === 'running' && !ct.poll) { $('btn-ct-eval').disabled = true; ct.poll = setInterval(ctPoll, 1500); } });
+    });
+  };
+
+  // ═════════════ 09 ЧАТ ═════════════
+  var cht = { id: null, chat: null, lastChanges: {}, after: 0, poll: null };
+
+  function bubble(m) {
+    if (m.role === 'user') return h('div', { class: 'bubble user', text: m.content });
+    var meta = m.meta || {};
+    var b = h('div', { class: 'bubble assistant ' + (meta.status || '') });
+    b.appendChild(h('div', { class: 'bubble__text', text: m.content }));
+    var src = h('div', { class: 'bubble__src' });
+    if (meta.sources && meta.sources.length) {
+      src.appendChild(h('b', { text: 'ИСТОЧНИКИ' }));
+      meta.sources.forEach(function (s) {
+        src.appendChild(h('span', { class: 'src-chip', title: (s.source || 'gutenberg:2701') + ' · ' + s.chunk_id, text: (s.n ? '[' + s.n + '] ' : '') + s.section }));
+      });
+      if (meta.sources_note) src.appendChild(h('div', { text: meta.sources_note }));
+    } else {
+      src.appendChild(h('b', { text: meta.status === 'setup' ? 'БЕЗ ПОИСКА' : 'ИСТОЧНИКИ' }));
+      src.appendChild(document.createTextNode(meta.sources_note || '—'));
+      if (meta.checked && meta.checked.length) {
+        var d = h('details', null, h('summary', { text: 'проверенные отрывки (' + meta.checked.length + ')' }));
+        meta.checked.forEach(function (c) { d.appendChild(h('div', { text: c.section + ' · ' + c.chunk_id + (c.rel != null ? ' · реранкер ' + c.rel.toFixed(2) : '') })); });
+        src.appendChild(d);
+      }
+    }
+    b.appendChild(src);
+    if (meta.quotes && meta.quotes.length && meta.status === 'answered') {
+      var dq = h('details', null, h('summary', { text: 'цитаты (' + meta.quotes.length + ')' }));
+      meta.quotes.forEach(function (q) { dq.appendChild(h('div', { class: 'quote__text', style: 'font-size:13px;margin:4px 0', text: '«' + q.quote + '» [' + q.source + ']' })); });
+      b.appendChild(dq);
+    }
+    if (meta.unverified_answer) b.appendChild(h('details', null, h('summary', { text: 'не выданный пересказ модели' }), h('div', { class: 'muted', text: meta.unverified_answer })));
+    var mt = h('div', { class: 'bubble__meta' });
+    if (meta.kind) mt.appendChild(h('span', { text: { question: 'вопрос', setup: 'уточнение задачи', summary: 'итог' }[meta.kind] }));
+    if (meta.search_query) mt.appendChild(h('span', { title: 'самостоятельный запрос для поиска', text: '🔎 ' + meta.search_query }));
+    if (meta.chapter_range) mt.appendChild(h('span', { text: 'главы ' + meta.chapter_range[0] + '–' + meta.chapter_range[1] }));
+    if (meta.latency_ms) mt.appendChild(h('span', { text: (meta.latency_ms / 1000).toFixed(1) + ' с' }));
+    b.appendChild(mt);
+    return b;
+  }
+
+  function memItems(list, key, fresh) {
+    return list.map(function (x) {
+      var text = key === 'term' ? x.term + ' — ' + x.meaning : x.text;
+      return h('div', { class: 'mem-item' + (fresh.indexOf(text) !== -1 || fresh.indexOf(x.text) !== -1 ? ' fresh' : '') }, text, h('small', { text: '#' + x.turn }));
+    });
+  }
+
+  function renderMem(st) {
+    var box = clear($('chat-mem'));
+    var ch = cht.lastChanges || {};
+    var goal = st.goal && st.goal.text;
+    $('chat-goal-line').textContent = goal ? '🎯 ' + goal : 'цель не задана';
+    box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: 'цель диалога' }),
+      goal ? h('div', { class: 'mem-goal' + (ch.goal ? ' fresh' : ''), text: goal }) : h('div', { class: 'muted small', text: 'не задана — напишите «Цель — …»' }),
+      st.goal ? h('div', { class: 'muted small mono', text: 'с хода #' + st.goal.turn + (st.goal_history.length ? ' · прежние цели: ' + st.goal_history.length : '') }) : null,
+      ch.goal_kept ? h('div', { class: 'chk warn', style: 'margin-top:4px', text: ch.goal_kept }) : null));
+    box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: 'поиск по главам' }),
+      h('div', { class: 'mem-range', text: st.chapter_range ? st.chapter_range[0] + '–' + st.chapter_range[1] : 'все (1–40)' })));
+    [['что уже уточнил пользователь', 'clarified', 'text'], ['ограничения', 'constraints', 'text'], ['термины', 'terms', 'term']].forEach(function (s) {
+      box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: s[0] }),
+        st[s[1]].length ? memItems(st[s[1]], s[2], ch[s[1]] || []) : h('div', { class: 'muted small', text: '—' })));
+    });
+    box.appendChild(h('div', { class: 'muted small mono', text: 'ходов: ' + (st.turns || 0) }));
+  }
+
+  function renderChat() {
+    var c = cht.chat, log = clear($('chat-log'));
+    $('chat-title').textContent = c ? c.title : '—';
+    if (!c) return;
+    if (!c.messages.length) log.appendChild(h('div', { class: 'empty', text: 'Начните с цели: «Цель — …», задайте ограничения («только главы 1–20») и термины — и спрашивайте.' }));
+    c.messages.forEach(function (m) { log.appendChild(bubble(m)); });
+    log.scrollTop = log.scrollHeight;
+    renderMem(c.state);
+  }
+
+  function loadChats(selectId) {
+    return api('/api/chats').then(function (d) {
+      var box = clear($('chat-list'));
+      d.chats.forEach(function (c) {
+        box.appendChild(h('div', { class: 'run' + (c.id === (selectId || cht.id) ? ' on' : ''), onclick: function () { openChat(c.id); } },
+          h('div', null, h('button', { class: 'del', type: 'button', title: 'удалить чат', text: '✕', onclick: function (e) {
+            e.stopPropagation(); if (!confirm('Удалить чат «' + c.title + '»?')) return;
+            fetch('/api/chats/' + c.id, { method: 'DELETE' }).then(function () { if (cht.id === c.id) { cht.id = null; cht.chat = null; renderChat(); } loadChats(); });
+          } }), c.title),
+          h('small', { text: c.messages + ' сообщ.' + (c.goal ? ' · 🎯 ' + c.goal : '') })));
+      });
+      if (!d.chats.length) box.appendChild(h('div', { class: 'muted small', text: 'Чатов пока нет.' }));
+      return d.chats;
+    });
+  }
+
+  function openChat(id) {
+    cht.id = id; cht.lastChanges = {}; lsSet('chat', id);
+    return api('/api/chats/' + id).then(function (d) { cht.chat = d.chat; renderChat(); loadChats(id); });
+  }
+
+  $('btn-chat-new').addEventListener('click', function () {
+    api('/api/chats', {}).then(function (d) { openChat(d.chat.id); $('chat-msg').focus(); });
+  });
+
+  function sendChat() {
+    var msg = $('chat-msg').value.trim();
+    if (!msg || !cht.id) return;
+    $('chat-msg').value = '';
+    cht.chat.messages.push({ role: 'user', content: msg });
+    renderChat();
+    var wait = h('div', { class: 'bubble assistant setup thinking', text: 'обновляю память задачи, ищу в книге, проверяю цитаты' });
+    $('chat-log').appendChild(wait); $('chat-log').scrollTop = $('chat-log').scrollHeight;
+    $('chat-send').disabled = true;
+    api('/api/chats/' + cht.id + '/send', { message: msg, model: models.current, judge: models.current }).then(function (r) {
+      cht.lastChanges = r.meta.state_changes || {};
+      cht.chat.messages.push({ role: 'assistant', content: r.reply, meta: r.meta });
+      cht.chat.state = r.state;
+      loadChats().then(function (list) {  // сервер называет чат по цели после первого сообщения
+        var c = list.filter(function (x) { return x.id === cht.id; })[0];
+        if (c) cht.chat.title = c.title;
+        renderChat();
+      });
+    }).catch(function (e) { wait.textContent = e.message; wait.classList.remove('thinking'); })
+      .finally(function () { $('chat-send').disabled = false; $('chat-msg').focus(); });
+  }
+  $('chat-form').addEventListener('submit', function (e) { e.preventDefault(); sendChat(); });
+  $('chat-msg').addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } });
+  $('mem-reset').addEventListener('click', function () {
+    if (!cht.id || !confirm('Очистить память задачи этого чата? История сообщений останется.')) return;
+    api('/api/chats/' + cht.id + '/state', {}).then(function (d) { cht.chat.state = d.state; cht.lastChanges = {}; renderChat(); loadChats(); });
+  });
+
+  // ── длинные сценарии ──
+  var SC_CHECKS = [['kind', 'тип реплики'], ['goal_kept', 'цель сохранена'], ['range_kept', 'диапазон глав сохранён'], ['range_respected', 'поиск в диапазоне'],
+    ['sources_always', 'источники выведены'], ['answered_with_sources', 'ответ с источниками'], ['chapter_found', 'нужная глава найдена'],
+    ['honest_unknown', '«не знаю» вне индекса'], ['summary_sources', 'итог с источниками'], ['summary_on_goal', 'итог по цели']];
+
+  function renderScenarios(res) {
+    var box = clear($('sc-results'));
+    if (!res) { box.appendChild(h('div', { class: 'empty', text: 'Прогона ещё нет для этой модели.' })); return; }
+    $('sc-meta').textContent = res.model + (res.finished ? ' · ' + new Date(res.finished * 1000).toLocaleString('ru-RU') : '');
+    res.scenarios.forEach(function (s) {
+      var t = s.totals;
+      box.appendChild(h('h3', { style: 'margin:16px 0 8px;font-size:14px;color:var(--rr)', text: '«' + s.title + '» — ' + t.messages + ' сообщений' }));
+      box.appendChild(h('div', { class: 'checks', style: 'margin-bottom:8px' }, SC_CHECKS.filter(function (c) { return t[c[0]] && t[c[0]].n; }).map(function (c) {
+        return chk(t[c[0]].ok === t[c[0]].n, c[1] + ' ' + t[c[0]].ok + '/' + t[c[0]].n, t[c[0]].ok >= t[c[0]].n - 1);
+      }).concat([chk(t.terms_kept, 'термины в памяти: ' + (t.final_terms.join(', ') || '—')), chk(t.constraints_kept, 'ограничения в памяти')])));
+      var tbl = h('table', { class: 't sc-turns' }, h('tr', null, h('th', { text: '#' }), h('th', { text: 'сообщение' }), h('th', { text: 'ответ' }),
+        h('th', { text: 'источники' }), h('th', { text: 'цель в памяти' }), h('th', { text: 'проверки' })));
+      s.turns.forEach(function (tr) {
+        var fails = Object.keys(tr.checks).filter(function (k) { return !tr.checks[k]; });
+        tbl.appendChild(h('tr', null, h('td', { class: 'num', text: tr.n }),
+          h('td', { class: 'msg' }, tr.msg, tr.search_query && tr.search_query !== tr.msg ? h('div', { class: 'muted small', text: '🔎 ' + tr.search_query }) : null),
+          h('td', { class: 'rep' }, h('span', { class: 'status ' + tr.status, style: 'font-size:10px;padding:0 5px', text: tr.status }), ' ', tr.reply.slice(0, 220)),
+          h('td', { class: 'small' }, tr.sources.length ? tr.sources.map(function (x) { return h('div', { text: x.section }); }) : h('span', { class: 'muted', text: tr.sources_note || '—' })),
+          h('td', { class: 'small muted', text: (tr.goal || '—') + (tr.chapter_range ? ' · гл. ' + tr.chapter_range.join('–') : '') }),
+          h('td', null, fails.length ? fails.map(function (k) { var n = SC_CHECKS.filter(function (c) { return c[0] === k; })[0]; return h('div', { class: 'chk bad', text: '✗ ' + (n ? n[1] : k) }); })
+            : h('span', { class: 'chk ok', text: '✓ ' + Object.keys(tr.checks).length }))));
+      });
+      box.appendChild(tbl);
+    });
+  }
+
+  function scLoad() { return api('/api/chat-eval/results?model=' + encodeURIComponent(models.current)).then(function (d) { renderScenarios(d.result); }); }
+
+  function scPoll() {
+    api('/api/chat-eval/status?after=' + cht.after).then(function (s) {
+      var con = $('sc-console');
+      if (cht.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      cht.after += s.log.length; con.scrollTop = con.scrollHeight;
+      if (s.progress) $('sc-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') return;
+      clearInterval(cht.poll); cht.poll = null; $('btn-sc').disabled = false;
+      scLoad(); loadChats();
+    }).catch(function () {});
+  }
+
+  $('btn-sc').addEventListener('click', function () {
+    cht.after = 0; clear($('sc-console'));
+    api('/api/chat-eval', { model: models.current }).then(function () {
+      $('btn-sc').disabled = true; if (!cht.poll) cht.poll = setInterval(scPoll, 2000);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.chat = function () {
+    loadModels().then(function () { $('sc-model').textContent = models.current; scLoad(); });
+    loadChats().then(function (list) {
+      var want = cht.id || lsGet('chat');
+      if (want && list.some(function (c) { return c.id === want; })) openChat(want);
+      else if (list.length) openChat(list[0].id);
+      else renderChat();
+    });
+    api('/api/chat-eval/status?after=0').then(function (s) { if (s.state === 'running' && !cht.poll) { $('btn-sc').disabled = true; cht.poll = setInterval(scPoll, 2000); } });
+  };
+
+  loadModels().catch(function () {});
+
   // ───────────── старт ─────────────
   show((location.hash || '').slice(1) || lsGet('tab') || 'index');
 })();

@@ -15,7 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analysis
 import chunking
 import embed
+import chat
+import chat_eval
+import experiment
+import grounded
 import indexer
+import llm
+import rag
+import rerank
 import store
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -49,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
     def _guard(self, fn):
         try:
             self._json(200, fn())
-        except embed.EmbedError as e:
+        except (embed.EmbedError, llm.LlmError) as e:
             self._json(503, {"error": str(e)})
         except (ValueError, KeyError) as e:
             self._json(400, {"error": str(e)})
@@ -74,6 +81,45 @@ class Handler(BaseHTTPRequestHandler):
             return self._guard(analysis.compare)
         if path == "/api/questions":
             return self._guard(lambda: {"questions": analysis.load_questions()})
+        if path == "/api/llm/models":
+            return self._guard(llm.catalog)
+        if path == "/api/rag/questions":
+            return self._guard(lambda: {"questions": rag.load_questions(), "strategy": rag.STRATEGY, "k": rag.TOP_K})
+        if path == "/api/chats":
+            return self._guard(lambda: {"chats": chat.list_chats()})
+        if path.startswith("/api/chats/"):
+            cid = path[len("/api/chats/"):]
+            def get():
+                c = chat.get_chat(cid)
+                if not c:
+                    raise ValueError("Чат не найден")
+                return {"chat": c}
+            return self._guard(get)
+        if path == "/api/chat-eval/status":
+            return self._guard(lambda: chat_eval.JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/chat-eval/results":
+            return self._guard(lambda: {"result": chat_eval.load_results(arg("model") or llm.DEFAULT_MODEL),
+                                        "scenarios": chat_eval.load_scenarios()})
+        if path == "/api/cite/config":
+            return self._guard(lambda: {"gate_min": grounded.GATE_MIN, "support_min": grounded.SUPPORT_MIN,
+                                        "fuzzy_min": grounded.FUZZY_MIN, "params": rerank.IMPROVED})
+        if path == "/api/cite/eval/status":
+            return self._guard(lambda: grounded.EVAL_JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/cite/results":
+            model = arg("model")
+            return self._guard(lambda: {"result": grounded.load_results(model)} if model else {"runs": grounded.list_results()})
+        if path == "/api/rerank/config":
+            return self._guard(lambda: {"base": rerank.BASE, "improved": rerank.IMPROVED, "limits": rerank.LIMITS,
+                                        "query_modes": rerank.QUERY_MODES, "reranker": rerank.status()})
+        if path == "/api/experiment/status":
+            return self._guard(lambda: experiment.JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/experiment/report":
+            return self._guard(lambda: {"report": experiment.load_report()})
+        if path == "/api/rag/eval/status":
+            return self._guard(lambda: rag.EVAL_JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/rag/results":
+            model = arg("model")
+            return self._guard(lambda: {"result": rag.load_results(model)} if model else {"runs": rag.list_results()})
 
         if path in ("/", "/index.html"):
             return self._file(WEB_DIR / "index.html")
@@ -103,6 +149,72 @@ class Handler(BaseHTTPRequestHandler):
             if not q:
                 return self._json(400, {"error": "Пустой запрос"})
             return self._guard(lambda: analysis.search(q, int(data.get("k", 5)), data.get("strategies")))
+        if path == "/api/ask":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            modes = [m for m in (data.get("modes") or rag.MODES) if m in rag.MODES]
+            return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K)),
+                                               params=data.get("params"), modes=modes))
+        if path == "/api/chats":
+            data = self._body()
+            return self._guard(lambda: {"chat": chat.create_chat(data.get("title"))})
+        if path.startswith("/api/chats/") and path.endswith("/send"):
+            cid = path[len("/api/chats/"):-len("/send")]
+            data = self._body()
+            msg = (data.get("message") or "").strip()
+            if not msg:
+                return self._json(400, {"error": "Пустое сообщение"})
+            return self._guard(lambda: chat.send(cid, msg, data.get("model") or llm.DEFAULT_MODEL, data.get("params"),
+                                                 data.get("gate_min"), data.get("judge")))
+        if path.startswith("/api/chats/") and path.endswith("/state"):
+            cid = path[len("/api/chats/"):-len("/state")]
+            data = self._body()
+            def go():
+                st = data.get("state") or chat.empty_state()
+                chat.set_state(cid, st)
+                return {"state": st}
+            return self._guard(go)
+        if path == "/api/chat-eval":
+            data = self._body()
+            return self._guard(lambda: {"started": chat_eval.start(data.get("model") or llm.DEFAULT_MODEL),
+                                        "state": chat_eval.JOB.state})
+        if path == "/api/cite/ask":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            return self._guard(lambda: grounded.answer(q, data.get("model") or llm.DEFAULT_MODEL, data.get("params"),
+                                                       float(data.get("gate_min", grounded.GATE_MIN)), data.get("judge")))
+        if path == "/api/cite/eval":
+            data = self._body()
+            return self._guard(lambda: {"started": grounded.start_eval(
+                data.get("model") or llm.DEFAULT_MODEL, data.get("judge"), data.get("params"),
+                float(data.get("gate_min", grounded.GATE_MIN))), "state": grounded.EVAL_JOB.state})
+        if path == "/api/rerank/funnel":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            return self._guard(lambda: rerank.funnel(q, rerank.params(data.get("params")), data.get("model") or llm.DEFAULT_MODEL))
+        if path == "/api/experiment":
+            data = self._body()
+            return self._guard(lambda: {"started": experiment.start(data.get("model") or llm.DEFAULT_MODEL),
+                                        "state": experiment.JOB.state})
+        if path == "/api/rag/eval":
+            data = self._body()
+            def go():
+                started = rag.start_eval(data.get("model") or llm.DEFAULT_MODEL, data.get("judge"), bool(data.get("force")))
+                return {"started": started, "state": rag.EVAL_JOB.state}
+            return self._guard(go)
+        self._json(404, {"error": "unknown endpoint"})
+
+    def do_DELETE(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/chats/"):
+            cid = path[len("/api/chats/"):]
+            return self._guard(lambda: (chat.delete_chat(cid), {"deleted": cid})[1])
         self._json(404, {"error": "unknown endpoint"})
 
     def log_message(self, fmt, *args):
