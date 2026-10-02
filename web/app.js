@@ -1215,6 +1215,198 @@
     });
   };
 
+  // ═════════════ 09 ЧАТ ═════════════
+  var cht = { id: null, chat: null, lastChanges: {}, after: 0, poll: null };
+
+  function bubble(m) {
+    if (m.role === 'user') return h('div', { class: 'bubble user', text: m.content });
+    var meta = m.meta || {};
+    var b = h('div', { class: 'bubble assistant ' + (meta.status || '') });
+    b.appendChild(h('div', { class: 'bubble__text', text: m.content }));
+    var src = h('div', { class: 'bubble__src' });
+    if (meta.sources && meta.sources.length) {
+      src.appendChild(h('b', { text: 'ИСТОЧНИКИ' }));
+      meta.sources.forEach(function (s) {
+        src.appendChild(h('span', { class: 'src-chip', title: (s.source || 'gutenberg:2701') + ' · ' + s.chunk_id, text: (s.n ? '[' + s.n + '] ' : '') + s.section }));
+      });
+      if (meta.sources_note) src.appendChild(h('div', { text: meta.sources_note }));
+    } else {
+      src.appendChild(h('b', { text: meta.status === 'setup' ? 'БЕЗ ПОИСКА' : 'ИСТОЧНИКИ' }));
+      src.appendChild(document.createTextNode(meta.sources_note || '—'));
+      if (meta.checked && meta.checked.length) {
+        var d = h('details', null, h('summary', { text: 'проверенные отрывки (' + meta.checked.length + ')' }));
+        meta.checked.forEach(function (c) { d.appendChild(h('div', { text: c.section + ' · ' + c.chunk_id + (c.rel != null ? ' · реранкер ' + c.rel.toFixed(2) : '') })); });
+        src.appendChild(d);
+      }
+    }
+    b.appendChild(src);
+    if (meta.quotes && meta.quotes.length && meta.status === 'answered') {
+      var dq = h('details', null, h('summary', { text: 'цитаты (' + meta.quotes.length + ')' }));
+      meta.quotes.forEach(function (q) { dq.appendChild(h('div', { class: 'quote__text', style: 'font-size:13px;margin:4px 0', text: '«' + q.quote + '» [' + q.source + ']' })); });
+      b.appendChild(dq);
+    }
+    if (meta.unverified_answer) b.appendChild(h('details', null, h('summary', { text: 'не выданный пересказ модели' }), h('div', { class: 'muted', text: meta.unverified_answer })));
+    var mt = h('div', { class: 'bubble__meta' });
+    if (meta.kind) mt.appendChild(h('span', { text: { question: 'вопрос', setup: 'уточнение задачи', summary: 'итог' }[meta.kind] }));
+    if (meta.search_query) mt.appendChild(h('span', { title: 'самостоятельный запрос для поиска', text: '🔎 ' + meta.search_query }));
+    if (meta.chapter_range) mt.appendChild(h('span', { text: 'главы ' + meta.chapter_range[0] + '–' + meta.chapter_range[1] }));
+    if (meta.latency_ms) mt.appendChild(h('span', { text: (meta.latency_ms / 1000).toFixed(1) + ' с' }));
+    b.appendChild(mt);
+    return b;
+  }
+
+  function memItems(list, key, fresh) {
+    return list.map(function (x) {
+      var text = key === 'term' ? x.term + ' — ' + x.meaning : x.text;
+      return h('div', { class: 'mem-item' + (fresh.indexOf(text) !== -1 || fresh.indexOf(x.text) !== -1 ? ' fresh' : '') }, text, h('small', { text: '#' + x.turn }));
+    });
+  }
+
+  function renderMem(st) {
+    var box = clear($('chat-mem'));
+    var ch = cht.lastChanges || {};
+    var goal = st.goal && st.goal.text;
+    $('chat-goal-line').textContent = goal ? '🎯 ' + goal : 'цель не задана';
+    box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: 'цель диалога' }),
+      goal ? h('div', { class: 'mem-goal' + (ch.goal ? ' fresh' : ''), text: goal }) : h('div', { class: 'muted small', text: 'не задана — напишите «Цель — …»' }),
+      st.goal ? h('div', { class: 'muted small mono', text: 'с хода #' + st.goal.turn + (st.goal_history.length ? ' · прежние цели: ' + st.goal_history.length : '') }) : null,
+      ch.goal_kept ? h('div', { class: 'chk warn', style: 'margin-top:4px', text: ch.goal_kept }) : null));
+    box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: 'поиск по главам' }),
+      h('div', { class: 'mem-range', text: st.chapter_range ? st.chapter_range[0] + '–' + st.chapter_range[1] : 'все (1–40)' })));
+    [['что уже уточнил пользователь', 'clarified', 'text'], ['ограничения', 'constraints', 'text'], ['термины', 'terms', 'term']].forEach(function (s) {
+      box.appendChild(h('div', { class: 'mem-sec' }, h('h4', { text: s[0] }),
+        st[s[1]].length ? memItems(st[s[1]], s[2], ch[s[1]] || []) : h('div', { class: 'muted small', text: '—' })));
+    });
+    box.appendChild(h('div', { class: 'muted small mono', text: 'ходов: ' + (st.turns || 0) }));
+  }
+
+  function renderChat() {
+    var c = cht.chat, log = clear($('chat-log'));
+    $('chat-title').textContent = c ? c.title : '—';
+    if (!c) return;
+    if (!c.messages.length) log.appendChild(h('div', { class: 'empty', text: 'Начните с цели: «Цель — …», задайте ограничения («только главы 1–20») и термины — и спрашивайте.' }));
+    c.messages.forEach(function (m) { log.appendChild(bubble(m)); });
+    log.scrollTop = log.scrollHeight;
+    renderMem(c.state);
+  }
+
+  function loadChats(selectId) {
+    return api('/api/chats').then(function (d) {
+      var box = clear($('chat-list'));
+      d.chats.forEach(function (c) {
+        box.appendChild(h('div', { class: 'run' + (c.id === (selectId || cht.id) ? ' on' : ''), onclick: function () { openChat(c.id); } },
+          h('div', null, h('button', { class: 'del', type: 'button', title: 'удалить чат', text: '✕', onclick: function (e) {
+            e.stopPropagation(); if (!confirm('Удалить чат «' + c.title + '»?')) return;
+            fetch('/api/chats/' + c.id, { method: 'DELETE' }).then(function () { if (cht.id === c.id) { cht.id = null; cht.chat = null; renderChat(); } loadChats(); });
+          } }), c.title),
+          h('small', { text: c.messages + ' сообщ.' + (c.goal ? ' · 🎯 ' + c.goal : '') })));
+      });
+      if (!d.chats.length) box.appendChild(h('div', { class: 'muted small', text: 'Чатов пока нет.' }));
+      return d.chats;
+    });
+  }
+
+  function openChat(id) {
+    cht.id = id; cht.lastChanges = {}; lsSet('chat', id);
+    return api('/api/chats/' + id).then(function (d) { cht.chat = d.chat; renderChat(); loadChats(id); });
+  }
+
+  $('btn-chat-new').addEventListener('click', function () {
+    api('/api/chats', {}).then(function (d) { openChat(d.chat.id); $('chat-msg').focus(); });
+  });
+
+  function sendChat() {
+    var msg = $('chat-msg').value.trim();
+    if (!msg || !cht.id) return;
+    $('chat-msg').value = '';
+    cht.chat.messages.push({ role: 'user', content: msg });
+    renderChat();
+    var wait = h('div', { class: 'bubble assistant setup thinking', text: 'обновляю память задачи, ищу в книге, проверяю цитаты' });
+    $('chat-log').appendChild(wait); $('chat-log').scrollTop = $('chat-log').scrollHeight;
+    $('chat-send').disabled = true;
+    api('/api/chats/' + cht.id + '/send', { message: msg, model: models.current, judge: models.current }).then(function (r) {
+      cht.lastChanges = r.meta.state_changes || {};
+      cht.chat.messages.push({ role: 'assistant', content: r.reply, meta: r.meta });
+      cht.chat.state = r.state;
+      loadChats().then(function (list) {  // сервер называет чат по цели после первого сообщения
+        var c = list.filter(function (x) { return x.id === cht.id; })[0];
+        if (c) cht.chat.title = c.title;
+        renderChat();
+      });
+    }).catch(function (e) { wait.textContent = e.message; wait.classList.remove('thinking'); })
+      .finally(function () { $('chat-send').disabled = false; $('chat-msg').focus(); });
+  }
+  $('chat-form').addEventListener('submit', function (e) { e.preventDefault(); sendChat(); });
+  $('chat-msg').addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } });
+  $('mem-reset').addEventListener('click', function () {
+    if (!cht.id || !confirm('Очистить память задачи этого чата? История сообщений останется.')) return;
+    api('/api/chats/' + cht.id + '/state', {}).then(function (d) { cht.chat.state = d.state; cht.lastChanges = {}; renderChat(); loadChats(); });
+  });
+
+  // ── длинные сценарии ──
+  var SC_CHECKS = [['kind', 'тип реплики'], ['goal_kept', 'цель сохранена'], ['range_kept', 'диапазон глав сохранён'], ['range_respected', 'поиск в диапазоне'],
+    ['sources_always', 'источники выведены'], ['answered_with_sources', 'ответ с источниками'], ['chapter_found', 'нужная глава найдена'],
+    ['honest_unknown', '«не знаю» вне индекса'], ['summary_sources', 'итог с источниками'], ['summary_on_goal', 'итог по цели']];
+
+  function renderScenarios(res) {
+    var box = clear($('sc-results'));
+    if (!res) { box.appendChild(h('div', { class: 'empty', text: 'Прогона ещё нет для этой модели.' })); return; }
+    $('sc-meta').textContent = res.model + (res.finished ? ' · ' + new Date(res.finished * 1000).toLocaleString('ru-RU') : '');
+    res.scenarios.forEach(function (s) {
+      var t = s.totals;
+      box.appendChild(h('h3', { style: 'margin:16px 0 8px;font-size:14px;color:var(--rr)', text: '«' + s.title + '» — ' + t.messages + ' сообщений' }));
+      box.appendChild(h('div', { class: 'checks', style: 'margin-bottom:8px' }, SC_CHECKS.filter(function (c) { return t[c[0]] && t[c[0]].n; }).map(function (c) {
+        return chk(t[c[0]].ok === t[c[0]].n, c[1] + ' ' + t[c[0]].ok + '/' + t[c[0]].n, t[c[0]].ok >= t[c[0]].n - 1);
+      }).concat([chk(t.terms_kept, 'термины в памяти: ' + (t.final_terms.join(', ') || '—')), chk(t.constraints_kept, 'ограничения в памяти')])));
+      var tbl = h('table', { class: 't sc-turns' }, h('tr', null, h('th', { text: '#' }), h('th', { text: 'сообщение' }), h('th', { text: 'ответ' }),
+        h('th', { text: 'источники' }), h('th', { text: 'цель в памяти' }), h('th', { text: 'проверки' })));
+      s.turns.forEach(function (tr) {
+        var fails = Object.keys(tr.checks).filter(function (k) { return !tr.checks[k]; });
+        tbl.appendChild(h('tr', null, h('td', { class: 'num', text: tr.n }),
+          h('td', { class: 'msg' }, tr.msg, tr.search_query && tr.search_query !== tr.msg ? h('div', { class: 'muted small', text: '🔎 ' + tr.search_query }) : null),
+          h('td', { class: 'rep' }, h('span', { class: 'status ' + tr.status, style: 'font-size:10px;padding:0 5px', text: tr.status }), ' ', tr.reply.slice(0, 220)),
+          h('td', { class: 'small' }, tr.sources.length ? tr.sources.map(function (x) { return h('div', { text: x.section }); }) : h('span', { class: 'muted', text: tr.sources_note || '—' })),
+          h('td', { class: 'small muted', text: (tr.goal || '—') + (tr.chapter_range ? ' · гл. ' + tr.chapter_range.join('–') : '') }),
+          h('td', null, fails.length ? fails.map(function (k) { var n = SC_CHECKS.filter(function (c) { return c[0] === k; })[0]; return h('div', { class: 'chk bad', text: '✗ ' + (n ? n[1] : k) }); })
+            : h('span', { class: 'chk ok', text: '✓ ' + Object.keys(tr.checks).length }))));
+      });
+      box.appendChild(tbl);
+    });
+  }
+
+  function scLoad() { return api('/api/chat-eval/results?model=' + encodeURIComponent(models.current)).then(function (d) { renderScenarios(d.result); }); }
+
+  function scPoll() {
+    api('/api/chat-eval/status?after=' + cht.after).then(function (s) {
+      var con = $('sc-console');
+      if (cht.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      cht.after += s.log.length; con.scrollTop = con.scrollHeight;
+      if (s.progress) $('sc-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') return;
+      clearInterval(cht.poll); cht.poll = null; $('btn-sc').disabled = false;
+      scLoad(); loadChats();
+    }).catch(function () {});
+  }
+
+  $('btn-sc').addEventListener('click', function () {
+    cht.after = 0; clear($('sc-console'));
+    api('/api/chat-eval', { model: models.current }).then(function () {
+      $('btn-sc').disabled = true; if (!cht.poll) cht.poll = setInterval(scPoll, 2000);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.chat = function () {
+    loadModels().then(function () { $('sc-model').textContent = models.current; scLoad(); });
+    loadChats().then(function (list) {
+      var want = cht.id || lsGet('chat');
+      if (want && list.some(function (c) { return c.id === want; })) openChat(want);
+      else if (list.length) openChat(list[0].id);
+      else renderChat();
+    });
+    api('/api/chat-eval/status?after=0').then(function (s) { if (s.state === 'running' && !cht.poll) { $('btn-sc').disabled = true; cht.poll = setInterval(scPoll, 2000); } });
+  };
+
   loadModels().catch(function () {});
 
   // ───────────── старт ─────────────

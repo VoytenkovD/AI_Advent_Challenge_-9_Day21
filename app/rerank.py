@@ -194,12 +194,18 @@ def status():
 
 # ═════════════════════════════ воронка ═════════════════════════════
 
-def funnel(question, p, model):
-    """Полный второй этап для одного вопроса. Возвращает итог с путём каждого кандидата."""
+def funnel(question, p, model, chapter_range=None):
+    """Полный второй этап для одного вопроса. Возвращает итог с путём каждого кандидата.
+    chapter_range — (с, по): ограничение из памяти задачи чата; чанки вне диапазона в поиск не попадают."""
     t0 = time.time()
     query, rewrite_ms = rewrite(question, p["query"], model)
     t1 = time.time()
-    hits = analysis.rank(query, STRATEGY, p["k_before"])
+    if chapter_range:
+        lo, hi = chapter_range
+        hits = [h for h in analysis.rank(query, STRATEGY, 1000)
+                if all(lo <= n <= hi for n in h[1]["chapters"])][:p["k_before"]]
+    else:
+        hits = analysis.rank(query, STRATEGY, p["k_before"])
     search_ms = round((time.time() - t1) * 1000)
 
     cands = []

@@ -30,6 +30,7 @@
   <button class="tab" data-tab="quality" role="tab"><b>06</b> Качество</button>
   <button class="tab" data-tab="rerank" role="tab"><b>07</b> Реранкинг</button>
   <button class="tab" data-tab="cite" role="tab"><b>08</b> Цитаты</button>
+  <button class="tab" data-tab="chat" role="tab"><b>09</b> Чат</button>
   <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
@@ -188,6 +189,38 @@
     </div>
     <div class="panel"><div class="panel__title">Итог <span class="muted small" id="ct-run-meta"></span></div><div id="ct-totals"></div></div>
     <div class="panel"><div class="panel__title">Вопросы</div><div id="ct-table"></div></div>
+  </section>
+
+  <!-- 09 ЧАТ -->
+  <section class="view" id="view-chat">
+    <div class="chat-layout">
+      <aside class="panel chat-list">
+        <div class="panel__title">Чаты</div>
+        <button class="btn btn--primary" id="btn-chat-new" style="width:100%;margin-bottom:10px;">+ Новый чат</button>
+        <div id="chat-list"></div>
+      </aside>
+      <div class="panel chat-main">
+        <div class="chat-head"><b id="chat-title">—</b><span class="muted small mono" id="chat-goal-line"></span></div>
+        <div class="chat-log" id="chat-log"><div class="empty">Создайте чат. Начните с цели: «Цель — …», задайте ограничения («только главы 1–20»), термины — и спрашивайте. Каждый ответ — по тексту книги и с источниками.</div></div>
+        <form class="chat-input" id="chat-form">
+          <textarea id="chat-msg" rows="2" placeholder="Сообщение… Enter — отправить, Shift+Enter — новая строка"></textarea>
+          <button class="btn btn--primary" type="submit" id="chat-send">Отправить</button>
+        </form>
+      </div>
+      <aside class="panel chat-mem">
+        <div class="panel__title">Память задачи <button class="link" type="button" id="mem-reset" title="очистить память задачи">сбросить</button></div>
+        <div id="chat-mem"><div class="muted small">Появится после первого сообщения.</div></div>
+      </aside>
+    </div>
+
+    <div class="panel">
+      <div class="panel__title">Длинные сценарии: не теряет ли ассистент цель и источники</div>
+      <div class="muted small" style="margin-bottom:10px;">2 сценария по 13 сообщений (<code>eval/chat_scenarios.json</code>): цель, ограничение по главам, термины, уточняющие вопросы с местоимениями, вопрос не по теме, вопрос, ответа на который нет в индексе, и «подведи итог». На каждом ходе проверяется: тип реплики, цель сохранена, диапазон глав сохранён и соблюдён в поиске, источники выведены, нужная глава найдена.</div>
+      <div class="controls"><label class="model-pick inline"><span>модель</span><b id="sc-model"></b></label><button class="btn btn--primary" id="btn-sc">▶ Прогнать сценарии</button><span class="muted small" id="sc-meta"></span></div>
+      <div class="progress"><div class="progress__bar" id="sc-bar"></div></div>
+      <div class="console console--short" id="sc-console"><div class="muted">Журнал прогона появится здесь.</div></div>
+      <div id="sc-results"></div>
+    </div>
   </section>
 </main>
 

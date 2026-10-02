@@ -155,10 +155,13 @@ def _sources_list(sources, ns):
              "rel": s.get("rel")} for s in sources if s["n"] in ns]
 
 
-def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None):
+def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None,
+           search_query=None, chapter_range=None, dialog=None, memory=None):
+    """dialog — предыдущие реплики чата (role/content), memory — блок памяти задачи для системного промпта,
+    search_query — самостоятельная формулировка вопроса для поиска (уточняющие вопросы «а он что?»)."""
     t0 = time.time()
     p = rerank.params(params)
-    f = rerank.funnel(question, p, model)
+    f = rerank.funnel(search_query or question, p, model, chapter_range)
     sources = f["sources"]
     best = max((s["rel"] if s["rel"] is not None else (1 + s["score"]) / 2 for s in sources), default=0.0)
     out = {"question": question, "model": model, "params": p, "gate_min": gate_min, "best_rel": round(best, 4),
@@ -175,8 +178,14 @@ def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None):
         return out
 
     # 2. ответ модели в JSON по схеме
-    res = llm.chat(model, [{"role": "system", "content": SYSTEM}, {"role": "user", "content": _prompt(question, sources)}],
+    system = SYSTEM + ("\n\n" + memory if memory else "")
+    res = llm.chat(model, [{"role": "system", "content": system}] + list(dialog or []) +
+                   [{"role": "user", "content": _prompt(question, sources)}],
                    temperature=0.1, max_tokens=700, schema=SCHEMA)
+    if re.search(r"[぀-ヿ一-鿿]", res["text"]):  # qwen иногда переключается на китайский — повтор
+        res = llm.chat(model, [{"role": "system", "content": system + "\n\nВАЖНО: поле answer пиши только по-русски."}]
+                       + list(dialog or []) + [{"role": "user", "content": _prompt(question, sources)}],
+                       temperature=0.0, max_tokens=700, schema=SCHEMA)
     data = _parse(res["text"]) or {"status": "answered", "answer": res["text"], "quotes": []}
     out.update(usage=res["usage"], raw=res["text"])
     answer_text = (data.get("answer") or "").strip()
@@ -204,7 +213,10 @@ def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None):
     # 4. совпадает ли смысл ответа с цитатами: судья (главный сигнал) + кросс-энкодер «цитаты по теме»
     statement = re.sub(r"\s*\[\d+\]", "", answer_text)
     support = rerank.support(statement, "\n".join('"{}"'.format(q["quote"]) for q in good))
-    meaning = judge_support(answer_text, good, judge_model or model)
+    if re.search(r"[぀-ヿ一-鿿]", answer_text):  # и повтор не помог — пересказ не выдаём
+        meaning = {"verdict": "нет", "reason": "ответ модели не на русском языке"}
+    else:
+        meaning = judge_support(answer_text, good, judge_model or model)
     out.update(sources=_sources_list(sources, cited), support=support, support_ok=support >= SUPPORT_MIN,
                judge_support=meaning)
     if meaning["verdict"] == "нет":  # цитаты настоящие, но пересказ им противоречит — пересказ не выдаём
