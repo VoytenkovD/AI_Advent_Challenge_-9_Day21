@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doc Index Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="brand__mark">◈</div>
+    <div>
+      <div class="brand__name">DOC·INDEX<span>/LAB</span></div>
+      <div class="brand__sub" id="brand-sub">локальный индекс документов</div>
+    </div>
+  </div>
+  <div class="pills" id="pills"></div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab" data-tab="index" role="tab"><b>01</b> Индекс</button>
+  <button class="tab" data-tab="chunks" role="tab"><b>02</b> Нарезка</button>
+  <button class="tab" data-tab="compare" role="tab"><b>03</b> Сравнение</button>
+  <button class="tab" data-tab="search" role="tab"><b>04</b> Поиск</button>
+</nav>
+
+<main>
+  <!-- 01 ИНДЕКС -->
+  <section class="view" id="view-index">
+    <div class="pipeline" id="pipeline"></div>
+    <div class="grid3">
+      <div class="panel"><div class="panel__title">Документ</div><div id="doc-card" class="kv">—</div></div>
+      <div class="panel"><div class="panel__title">Модель эмбеддингов</div><div id="model-card" class="kv">—</div></div>
+      <div class="panel"><div class="panel__title">Управление</div>
+        <div class="controls">
+          <button class="btn btn--primary" id="btn-build">▶ Построить индекс</button>
+          <button class="btn" id="btn-rebuild">⟲ Построить заново</button>
+        </div>
+        <div class="progress"><div class="progress__bar" id="progress-bar"></div></div>
+        <div class="muted small" id="progress-text">ожидание</div>
+      </div>
+    </div>
+    <div class="grid2" id="variant-cards"></div>
+    <div class="panel">
+      <div class="panel__title">Журнал индексации <span class="muted small" id="log-state"></span></div>
+      <div class="console" id="console"><div class="muted">Журнал появится после запуска индексации.</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel__title">Пример чанка со всеми метаданными</div>
+      <div id="sample">—</div>
+    </div>
+  </section>
+
+  <!-- 02 НАРЕЗКА -->
+  <section class="view" id="view-chunks">
+    <div class="toolbar">
+      <button class="btn btn--icon" id="ch-prev" title="Предыдущая глава">◀</button>
+      <select id="ch-select"></select>
+      <button class="btn btn--icon" id="ch-next" title="Следующая глава">▶</button>
+      <span class="legend"><i class="sw sw--fixed"></i>fixed <i class="sw sw--structure"></i>structure <i class="sw sw--ovl"></i>перекрытие <span class="cut">✂</span> разрез посреди предложения</span>
+    </div>
+    <div class="grid2 chunk-cols" id="chunk-cols"></div>
+    <div class="panel" id="chunk-detail" hidden></div>
+  </section>
+
+  <!-- 03 СРАВНЕНИЕ -->
+  <section class="view" id="view-compare">
+    <div class="panel"><div class="panel__title">Вывод <span class="muted small" id="cmp-ms"></span></div><ul class="conclusion" id="conclusion"><li class="muted">Считаю метрики…</li></ul></div>
+    <div class="grid2">
+      <div class="panel"><div class="panel__title">Метрики нарезки</div><div id="metrics-table"></div></div>
+      <div class="panel"><div class="panel__title">Качество поиска по контрольным вопросам</div><div id="retrieval-chart"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Распределение размеров чанков, токены</div><div class="grid2" id="histograms"></div></div>
+    <div class="panel"><div class="panel__title">Контрольные вопросы: на каком месте нашлась нужная глава</div><div id="questions-table"></div></div>
+  </section>
+
+  <!-- 04 ПОИСК -->
+  <section class="view" id="view-search">
+    <form class="searchbar" id="search-form">
+      <input id="q" autocomplete="off" placeholder="Вопрос по-русски или по-английски, например: как Квикег спас тонущего?">
+      <select id="k"><option>3</option><option selected>5</option><option>10</option></select>
+      <button class="btn btn--primary" type="submit">Искать</button>
+    </form>
+    <div class="chips" id="examples"></div>
+    <div class="muted small" id="search-meta"></div>
+    <div class="grid2" id="results"></div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

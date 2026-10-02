@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Индекс и скачанные книги (строятся заново кнопкой «Построить индекс»)
+data/
+
+# Секреты и редакторы
+.env
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
