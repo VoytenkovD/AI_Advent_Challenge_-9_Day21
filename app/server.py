@@ -16,6 +16,8 @@ import analysis
 import chunking
 import embed
 import indexer
+import llm
+import rag
 import store
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -49,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
     def _guard(self, fn):
         try:
             self._json(200, fn())
-        except embed.EmbedError as e:
+        except (embed.EmbedError, llm.LlmError) as e:
             self._json(503, {"error": str(e)})
         except (ValueError, KeyError) as e:
             self._json(400, {"error": str(e)})
@@ -74,6 +76,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._guard(analysis.compare)
         if path == "/api/questions":
             return self._guard(lambda: {"questions": analysis.load_questions()})
+        if path == "/api/llm/models":
+            return self._guard(llm.catalog)
+        if path == "/api/rag/questions":
+            return self._guard(lambda: {"questions": rag.load_questions(), "strategy": rag.STRATEGY, "k": rag.TOP_K})
+        if path == "/api/rag/eval/status":
+            return self._guard(lambda: rag.EVAL_JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/rag/results":
+            model = arg("model")
+            return self._guard(lambda: {"result": rag.load_results(model)} if model else {"runs": rag.list_results()})
 
         if path in ("/", "/index.html"):
             return self._file(WEB_DIR / "index.html")
@@ -103,6 +114,18 @@ class Handler(BaseHTTPRequestHandler):
             if not q:
                 return self._json(400, {"error": "Пустой запрос"})
             return self._guard(lambda: analysis.search(q, int(data.get("k", 5)), data.get("strategies")))
+        if path == "/api/ask":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K))))
+        if path == "/api/rag/eval":
+            data = self._body()
+            def go():
+                started = rag.start_eval(data.get("model") or llm.DEFAULT_MODEL, data.get("judge"), bool(data.get("force")))
+                return {"started": started, "state": rag.EVAL_JOB.state}
+            return self._guard(go)
         self._json(404, {"error": "unknown endpoint"})
 
     def log_message(self, fmt, *args):

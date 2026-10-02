@@ -26,6 +26,9 @@
   <button class="tab" data-tab="chunks" role="tab"><b>02</b> Нарезка</button>
   <button class="tab" data-tab="compare" role="tab"><b>03</b> Сравнение</button>
   <button class="tab" data-tab="search" role="tab"><b>04</b> Поиск</button>
+  <button class="tab" data-tab="ask" role="tab"><b>05</b> Вопрос · RAG</button>
+  <button class="tab" data-tab="quality" role="tab"><b>06</b> Качество</button>
+  <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
 <main>
@@ -88,6 +91,41 @@
     <div class="chips" id="examples"></div>
     <div class="muted small" id="search-meta"></div>
     <div class="grid2" id="results"></div>
+  </section>
+
+  <!-- 05 ВОПРОС · RAG -->
+  <section class="view" id="view-ask">
+    <div class="flow" id="rag-flow"></div>
+    <form class="searchbar" id="ask-form">
+      <input id="ask-q" autocomplete="off" placeholder="Вопрос о «Моби Дике» (главы 1–40), например: из чего была нога Ахава?">
+      <select id="ask-k" title="Сколько отрывков отдать модели"><option value="3">top-3</option><option value="5" selected>top-5</option><option value="8">top-8</option></select>
+      <button class="btn btn--primary" type="submit" id="ask-btn">Спросить</button>
+    </form>
+    <div class="chips" id="ask-examples"></div>
+    <div id="ask-expected"></div>
+    <div class="grid2" id="answers"></div>
+    <div class="panel" id="ask-sources" hidden></div>
+  </section>
+
+  <!-- 06 КАЧЕСТВО -->
+  <section class="view" id="view-quality">
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Прогон контрольных вопросов</div>
+        <div class="muted small" style="margin-bottom:10px;">10 вопросов из <code>eval/rag.json</code>: на каждый — ответ без RAG, ответ с RAG и оценка судьи (верно / частично / неверно) по эталону. Код отдельно проверяет, попала ли нужная глава в найденные отрывки.</div>
+        <div class="controls">
+          <label class="model-pick inline"><span>отвечает</span><b id="eval-model"></b></label>
+          <label class="model-pick inline"><span>судья</span><select id="judge-select"></select></label>
+          <label class="check"><input type="checkbox" id="eval-force"> заново</label>
+          <button class="btn btn--primary" id="btn-eval">▶ Запустить прогон</button>
+        </div>
+        <div class="progress"><div class="progress__bar" id="eval-bar"></div></div>
+        <div class="console console--short" id="eval-console"><div class="muted">Журнал прогона появится здесь.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Сохранённые прогоны</div><div id="runs"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Итог <span class="muted small" id="q-model"></span></div><div id="q-totals"></div></div>
+    <div class="panel"><div class="panel__title">Вопросы: ожидание, источник и ответы</div><div id="q-table"></div></div>
   </section>
 </main>
 

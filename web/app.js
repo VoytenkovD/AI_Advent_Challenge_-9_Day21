@@ -476,6 +476,267 @@
     $('q').focus();
   };
 
+  // ═════════════ LLM: выбор модели (общий для вкладок 05 и 06) ═════════════
+  var models = { list: [], current: null };
+
+  function fillModelSelect(sel, value) {
+    clear(sel);
+    models.catalog && Object.keys(models.catalog.providers).forEach(function (p) {
+      var info = models.catalog.providers[p];
+      var og = h('optgroup', { label: p + (info.ok ? '' : ' — недоступен') });
+      info.models.forEach(function (m) { og.appendChild(h('option', { value: p + ':' + m, text: m })); });
+      if (!info.models.length) og.appendChild(h('option', { disabled: 'disabled', text: info.ok ? 'нет моделей' : (info.error || '').slice(0, 60) }));
+      sel.appendChild(og);
+    });
+    if (value) sel.value = value;
+  }
+
+  function loadModels() {
+    if (models.catalog) return Promise.resolve(models.catalog);
+    return api('/api/llm/models').then(function (c) {
+      models.catalog = c;
+      var saved = lsGet('model');
+      models.current = saved || c.default;
+      fillModelSelect($('model-select'), models.current);
+      if ($('model-select').value !== models.current) { models.current = c.default; $('model-select').value = c.default; }
+      fillModelSelect($('judge-select'), lsGet('judge') || models.current);
+      $('eval-model').textContent = models.current;
+      return c;
+    });
+  }
+  $('model-select').addEventListener('change', function () {
+    models.current = this.value; lsSet('model', this.value);
+    $('eval-model').textContent = this.value;
+    if (document.getElementById('view-quality').classList.contains('active')) loadRuns();
+  });
+  $('judge-select').addEventListener('change', function () { lsSet('judge', this.value); });
+
+  // ═════════════ 05 ВОПРОС · RAG ═════════════
+  var ragQuestions = [];
+  var askQuestion = null;
+
+  function renderFlow() {
+    var box = clear($('rag-flow'));
+    [['p', 'вопрос → LLM'], ['', '→'], ['p', 'ответ без RAG'], ['', '|'],
+     ['r', 'вопрос → bge-m3'], ['', '→'], ['r', 'top-k чанков structure'], ['', '→'], ['r', 'вопрос + отрывки [n] → LLM'], ['', '→'], ['r', 'ответ с RAG и ссылками']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' || x[1] === '|' ? h('i', { text: x[1] }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  function withCites(text, onCite) {
+    var box = h('div', { class: 'answer__text' });
+    text.split(/(\[\d+(?:\s*,\s*\d+)*\])/).forEach(function (part) {
+      var m = part.match(/^\[(\d+(?:\s*,\s*\d+)*)\]$/);
+      if (!m) { box.appendChild(document.createTextNode(part)); return; }
+      m[1].split(',').forEach(function (n) {
+        n = +n.trim();
+        box.appendChild(h('span', { class: 'cite', text: n, title: 'отрывок ' + n, onclick: function () { onCite(n); } }));
+      });
+    });
+    return box;
+  }
+
+  function answerPanel(kind, a) {
+    var title = kind === 'plain' ? 'Без RAG' : 'С RAG';
+    var sub = kind === 'plain' ? 'по памяти модели' : 'по найденным отрывкам';
+    var p = h('div', { class: 'panel answer answer--' + kind },
+      h('div', { class: 'answer__head' }, h('div', null, h('span', { class: 'answer__name', text: title }), ' ', h('span', { class: 'muted small', text: sub })),
+        a && a.model ? h('span', { class: 'muted small mono', text: a.model }) : null));
+    if (!a) { p.appendChild(h('div', { class: 'thinking', text: kind === 'plain' ? 'модель вспоминает' : 'ищу отрывки и читаю' })); return p; }
+    if (a.error) { p.appendChild(h('div', { class: 'flag warn', text: a.error })); return p; }
+    p.appendChild(kind === 'rag' ? withCites(a.text, flashSource) : h('div', { class: 'answer__text', text: a.text }));
+    var meta = h('div', { class: 'answer__meta' },
+      h('span', { class: 'flag', text: (a.latency_ms / 1000).toFixed(1) + ' с' }),
+      h('span', { class: 'flag', text: 'промпт ' + a.usage.prompt + ' · ответ ' + a.usage.completion + ' ток.' }));
+    if (kind === 'rag') {
+      meta.appendChild(h('span', { class: 'flag', text: 'поиск ' + a.search_ms + ' мс' }));
+      meta.appendChild(h('span', { class: 'flag' + (a.cited.length ? ' ok' : ' warn'), text: a.cited.length ? 'ссылки: ' + a.cited.join(', ') : 'без ссылок на отрывки' }));
+      if (askQuestion && askQuestion.chapters.length) {
+        var hit = a.sources.some(function (s) { return s.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; }); });
+        meta.appendChild(h('span', { class: 'flag ' + (hit ? 'ok' : 'warn'), text: hit ? 'нужная глава в отрывках' : 'нужной главы нет в отрывках' }));
+      }
+    }
+    p.appendChild(meta);
+    return p;
+  }
+
+  function flashSource(n) {
+    var el = document.querySelector('.src[data-n="' + n + '"]');
+    if (!el) return;
+    el.classList.add('open', 'flash');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setTimeout(function () { el.classList.remove('flash'); }, 1600);
+  }
+
+  function renderSources(a) {
+    var box = $('ask-sources');
+    if (!a || !a.sources) { box.hidden = true; return; }
+    box.hidden = false;
+    clear(box).appendChild(h('div', { class: 'panel__title', text: 'Отрывки, которые получила модель (' + a.sources.length + ', стратегия structure, ' + a.prompt_chars + ' символов контекста)' }));
+    a.sources.forEach(function (s) {
+      var expectedHit = askQuestion && s.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; });
+      var row = h('div', { class: 'src', 'data-n': s.n },
+        h('div', { class: 'src__n' + (a.cited.indexOf(s.n) !== -1 ? ' cited' : ''), text: '[' + s.n + ']', title: a.cited.indexOf(s.n) !== -1 ? 'модель сослалась на этот отрывок' : '' }),
+        h('div', null,
+          h('div', { class: 'src__head' }, h('span', null, (expectedHit ? '✔ ' : '') + s.section),
+            h('span', { class: 'muted' }, s.chunk_id + ' · сходство ' + s.similarity.toFixed(3) + ' · ' + s.tokens + ' ток. ',
+              h('button', { class: 'link', type: 'button', text: 'в нарезке →', onclick: function () { openInChunks(s); } }))),
+          h('div', { class: 'src__text', text: s.text, title: 'клик — развернуть', onclick: function () { row.classList.toggle('open'); } })));
+      box.appendChild(row);
+    });
+  }
+
+  function renderExpected() {
+    var box = clear($('ask-expected'));
+    if (!askQuestion) return;
+    box.appendChild(h('div', { class: 'expected' }, h('b', { text: 'ожидание' }), askQuestion.expected,
+      h('div', { class: 'muted small', style: 'margin-top:4px', text: 'источник: ' + (askQuestion.chapters.length ? askQuestion.sources.join(', ') : 'нет — правильный ответ «в книге этого нет»') })));
+  }
+
+  function runAsk() {
+    var q = $('ask-q').value.trim();
+    if (!q) return;
+    if (askQuestion && askQuestion.q !== q) askQuestion = null;
+    document.querySelectorAll('#ask-examples .chip').forEach(function (c) { c.classList.toggle('on', !!askQuestion && c.textContent === askQuestion.q); });
+    renderExpected();
+    var ans = clear($('answers'));
+    ans.appendChild(answerPanel('plain', null));
+    ans.appendChild(answerPanel('rag', null));
+    $('ask-sources').hidden = true;
+    $('ask-btn').disabled = true;
+    api('/api/ask', { q: q, model: models.current, k: +$('ask-k').value }).then(function (r) {
+      clear(ans);
+      ans.appendChild(answerPanel('plain', r.plain));
+      ans.appendChild(answerPanel('rag', r.rag));
+      renderSources(r.rag);
+    }).catch(function (e) {
+      clear(ans).appendChild(h('div', { class: 'empty', text: e.message }));
+    }).finally(function () { $('ask-btn').disabled = false; });
+  }
+  $('ask-form').addEventListener('submit', function (e) { e.preventDefault(); runAsk(); });
+
+  function loadRagQuestions() {
+    if (ragQuestions.length) return Promise.resolve(ragQuestions);
+    return api('/api/rag/questions').then(function (d) { ragQuestions = d.questions; return ragQuestions; });
+  }
+
+  loaders.ask = function () {
+    renderFlow();
+    Promise.all([loadModels(), loadRagQuestions()]).then(function () {
+      var box = clear($('ask-examples'));
+      ragQuestions.forEach(function (q) {
+        box.appendChild(h('button', { class: 'chip', type: 'button', text: q.q, onclick: function () { askQuestion = q; $('ask-q').value = q.q; runAsk(); } }));
+      });
+    });
+    $('ask-q').focus();
+  };
+
+  // ═════════════ 06 КАЧЕСТВО ═════════════
+  var evalAfter = 0, evalPoll = null;
+
+  function verdictChip(v) { return h('span', { class: 'verdict v-' + (v || 'none'), text: v || '—' }); }
+
+  function stack(t, n) {
+    var box = h('div', { class: 'stack' });
+    [['верно', 's1'], ['частично', 's2'], ['неверно', 's3']].forEach(function (x) {
+      if (t[x[0]]) box.appendChild(h('i', { class: x[1], style: 'width:' + (t[x[0]] / n * 100) + '%', title: x[0] + ': ' + t[x[0]] }));
+    });
+    return box;
+  }
+
+  function renderTotals(res) {
+    var box = clear($('q-totals'));
+    $('q-model').textContent = res ? res.model + ' · судья ' + res.judge + ' · ' + new Date(res.finished * 1000).toLocaleString('ru-RU') : '';
+    if (!res) { box.appendChild(h('div', { class: 'empty', text: 'Для этой модели прогона ещё нет — нажмите «Запустить прогон».' })); return; }
+    var t = res.totals, n = t.questions;
+    box.appendChild(h('div', { class: 'score' },
+      h('div', { class: 'score__card p' }, h('div', { class: 'stat__k', text: 'без RAG — верно' }), h('div', { class: 'score__big', text: t.plain['верно'] + ' / ' + n }),
+        stack(t.plain, n), h('div', { class: 'muted small', text: 'частично ' + t.plain['частично'] + ' · неверно ' + t.plain['неверно'] })),
+      h('div', { class: 'score__card r' }, h('div', { class: 'stat__k', text: 'с RAG — верно' }), h('div', { class: 'score__big', text: t.rag['верно'] + ' / ' + n }),
+        stack(t.rag, n), h('div', { class: 'muted small', text: 'частично ' + t.rag['частично'] + ' · неверно ' + t.rag['неверно'] })),
+      h('div', { class: 'score__card s' }, h('div', { class: 'stat__k', text: 'нужная глава в отрывках' }), h('div', { class: 'score__big', text: t.chapter_hit + ' / ' + t.with_source }),
+        h('div', { class: 'muted small', text: 'проверка кодом, без судьи; вопрос-ловушка не считается' }))));
+  }
+
+  function renderQTable(res) {
+    var box = clear($('q-table'));
+    var tbl = h('table', { class: 't qa' }, h('tr', null, h('th', { text: 'вопрос' }), h('th', { text: 'ожидание · источник' }),
+      h('th', { style: 'color:var(--plain)', text: 'без RAG' }), h('th', { style: 'color:var(--structure)', text: 'с RAG' }), h('th', { text: 'глава в отрывках' })));
+    ragQuestions.forEach(function (q) {
+      var it = res && res.items[q.id];
+      function cell(mode) {
+        var a = it && it[mode];
+        if (!a) return h('td', { class: 'ans muted', text: '—' });
+        return h('td', { class: 'ans' }, verdictChip(a.verdict), ' ', a.error ? h('span', { class: 'flag warn', text: a.error }) : a.text,
+          a.reason ? h('div', { class: 'reason', text: 'судья: ' + a.reason }) : null);
+      }
+      tbl.appendChild(h('tr', null,
+        h('td', null, q.q, q.verified ? null : h('div', { class: 'flag warn', text: 'не подтверждён текстом' })),
+        h('td', { class: 'exp' }, q.expected, h('div', { class: 'muted small', style: 'margin-top:4px', text: q.chapters.length ? q.sources.join(', ') : 'источника нет (ловушка)' })),
+        cell('plain'), cell('rag'),
+        h('td', { class: 'num' }, !it || it.chapter_hit == null ? '—' : it.chapter_hit ? h('span', { class: 'verdict v-верно', text: 'да' }) : h('span', { class: 'verdict v-неверно', text: 'нет' }))));
+    });
+    box.appendChild(tbl);
+  }
+
+  function showResult(model) {
+    return api('/api/rag/results?model=' + encodeURIComponent(model)).then(function (d) {
+      renderTotals(d.result); renderQTable(d.result);
+      document.querySelectorAll('.run').forEach(function (r) { r.classList.toggle('on', r.dataset.model === model); });
+    });
+  }
+
+  function loadRuns() {
+    return api('/api/rag/results').then(function (d) {
+      var box = clear($('runs'));
+      if (!d.runs.length) box.appendChild(h('div', { class: 'muted small', text: 'Прогонов пока нет.' }));
+      d.runs.forEach(function (r) {
+        var t = r.totals;
+        box.appendChild(h('div', { class: 'run', 'data-model': r.model, onclick: function () { showResult(r.model); } },
+          h('div', null, r.model, h('br'), h('small', { text: 'судья ' + r.judge })),
+          h('div', { style: 'text-align:right' }, h('span', { style: 'color:var(--plain)', text: t.plain['верно'] }), ' → ',
+            h('span', { style: 'color:var(--structure)', text: t.rag['верно'] }), h('small', { text: ' из ' + t.questions }))));
+      });
+      return showResult(models.current);
+    });
+  }
+
+  function pollEval() {
+    api('/api/rag/eval/status?after=' + evalAfter).then(function (s) {
+      var con = $('eval-console');
+      if (evalAfter === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      evalAfter += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('eval-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') { showResult(models.current); return; }
+      clearInterval(evalPoll); evalPoll = null;
+      $('btn-eval').disabled = false;
+      if (s.state === 'done') $('eval-bar').style.width = '100%';
+      loadRuns();
+    }).catch(function () {});
+  }
+
+  $('btn-eval').addEventListener('click', function () {
+    evalAfter = 0;
+    clear($('eval-console'));
+    $('eval-bar').style.width = '2%';
+    api('/api/rag/eval', { model: models.current, judge: $('judge-select').value, force: $('eval-force').checked }).then(function (r) {
+      if (!r.started) { alert('Прогон уже идёт'); }
+      $('btn-eval').disabled = true;
+      if (!evalPoll) evalPoll = setInterval(pollEval, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.quality = function () {
+    Promise.all([loadModels(), loadRagQuestions()]).then(function () {
+      $('eval-model').textContent = models.current;
+      loadRuns();
+      api('/api/rag/eval/status?after=0').then(function (s) { if (s.state === 'running' && !evalPoll) { $('btn-eval').disabled = true; evalPoll = setInterval(pollEval, 1500); } });
+    });
+  };
+
+  loadModels().catch(function () {});
+
   // ───────────── старт ─────────────
   show((location.hash || '').slice(1) || lsGet('tab') || 'index');
 })();
