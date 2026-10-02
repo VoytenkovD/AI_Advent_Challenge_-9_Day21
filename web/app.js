@@ -517,8 +517,9 @@
 
   function renderFlow() {
     var box = clear($('rag-flow'));
-    [['p', 'вопрос → LLM'], ['', '→'], ['p', 'ответ без RAG'], ['', '|'],
-     ['r', 'вопрос → bge-m3'], ['', '→'], ['r', 'top-k чанков structure'], ['', '→'], ['r', 'вопрос + отрывки [n] → LLM'], ['', '→'], ['r', 'ответ с RAG и ссылками']
+    [['p', 'без RAG: вопрос → LLM'], ['', '|'],
+     ['r', 'RAG: вопрос → bge-m3 → top-5'], ['', '→'], ['r', 'вопрос + отрывки [n] → LLM'], ['', '|'],
+     ['g', 'RAG + rerank: rewrite'], ['', '→'], ['g', 'top-K до'], ['', '→'], ['g', 'порог косинуса'], ['', '→'], ['g', 'реранкер + порог'], ['', '→'], ['g', 'top-K после → LLM']
     ].forEach(function (x) { box.appendChild(x[1] === '→' || x[1] === '|' ? h('i', { text: x[1] }) : h('span', { class: x[0], text: x[1] })); });
   }
 
@@ -535,19 +536,30 @@
     return box;
   }
 
+  var KIND = {
+    plain: ['Без RAG', 'по памяти модели', 'модель вспоминает'],
+    rag: ['RAG', 'вопрос как есть, top-5', 'ищу отрывки и читаю'],
+    rag2: ['RAG + rerank', 'rewrite → фильтр → реранкер', 'переписываю вопрос, фильтрую и ранжирую']
+  };
+
   function answerPanel(kind, a) {
-    var title = kind === 'plain' ? 'Без RAG' : 'С RAG';
-    var sub = kind === 'plain' ? 'по памяти модели' : 'по найденным отрывкам';
+    var title = KIND[kind][0];
+    var sub = KIND[kind][1];
     var p = h('div', { class: 'panel answer answer--' + kind },
       h('div', { class: 'answer__head' }, h('div', null, h('span', { class: 'answer__name', text: title }), ' ', h('span', { class: 'muted small', text: sub })),
         a && a.model ? h('span', { class: 'muted small mono', text: a.model }) : null));
-    if (!a) { p.appendChild(h('div', { class: 'thinking', text: kind === 'plain' ? 'модель вспоминает' : 'ищу отрывки и читаю' })); return p; }
+    if (!a) { p.appendChild(h('div', { class: 'thinking', text: KIND[kind][2] })); return p; }
     if (a.error) { p.appendChild(h('div', { class: 'flag warn', text: a.error })); return p; }
-    p.appendChild(kind === 'rag' ? withCites(a.text, flashSource) : h('div', { class: 'answer__text', text: a.text }));
+    p.appendChild(kind === 'plain' ? h('div', { class: 'answer__text', text: a.text })
+      : withCites(a.text, function (n) { flashSource(n, kind); }));
     var meta = h('div', { class: 'answer__meta' },
       h('span', { class: 'flag', text: (a.latency_ms / 1000).toFixed(1) + ' с' }),
       h('span', { class: 'flag', text: 'промпт ' + a.usage.prompt + ' · ответ ' + a.usage.completion + ' ток.' }));
-    if (kind === 'rag') {
+    if (kind === 'rag2' && a.funnel) {
+      var fc = a.funnel.counts;
+      meta.appendChild(h('span', { class: 'flag ' + (fc.kept ? '' : 'warn'), text: 'отрывков: ' + fc.before + ' → ' + fc.kept }));
+    }
+    if (kind !== 'plain') {
       meta.appendChild(h('span', { class: 'flag', text: 'поиск ' + a.search_ms + ' мс' }));
       meta.appendChild(h('span', { class: 'flag' + (a.cited.length ? ' ok' : ' warn'), text: a.cited.length ? 'ссылки: ' + a.cited.join(', ') : 'без ссылок на отрывки' }));
       if (askQuestion && askQuestion.chapters.length) {
@@ -559,8 +571,9 @@
     return p;
   }
 
-  function flashSource(n) {
-    var el = document.querySelector('.src[data-n="' + n + '"]');
+  function flashSource(n, kind) {
+    var el = kind === 'rag2' ? document.querySelector('#ask-funnel tr[data-final="' + n + '"]')
+      : document.querySelector('#ask-sources .src[data-n="' + n + '"]');
     if (!el) return;
     el.classList.add('open', 'flash');
     el.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -585,6 +598,75 @@
     });
   }
 
+  // ── настройки воронки улучшенного RAG ──
+  var rr = { config: null };
+  var TUNE = ['k_before', 'sim_min', 'rel_min', 'k_after'];
+
+  function tuneParams() {
+    var p = { query: $('t-query').value, rerank: $('t-rerank').checked };
+    TUNE.forEach(function (k) { p[k] = +$('t-' + k).value; });
+    return p;
+  }
+
+  function tuneSummary() {
+    var p = tuneParams();
+    TUNE.forEach(function (k) { $('v-' + k).textContent = p[k]; });
+    $('t-rel_min').disabled = !p.rerank;
+    $('tune-sum').textContent = '— ' + p.query + ' · top-' + p.k_before + ' → cos ≥ ' + p.sim_min +
+      (p.rerank ? ' → реранкер ≥ ' + p.rel_min : ' · без реранкера') + ' → top-' + p.k_after;
+    lsSet('tune', JSON.stringify(p));
+  }
+
+  function setTune(p) {
+    $('t-query').value = p.query; $('t-rerank').checked = !!p.rerank;
+    TUNE.forEach(function (k) { $('t-' + k).value = p[k]; });
+    tuneSummary();
+  }
+
+  function loadTune() {
+    if (rr.config) return Promise.resolve(rr.config);
+    return api('/api/rerank/config').then(function (c) {
+      rr.config = c;
+      var saved = null;
+      try { saved = JSON.parse(lsGet('tune') || 'null'); } catch (e) {}
+      setTune(saved || c.improved);
+      $('t-note').textContent = c.reranker.pulled ? 'реранкер: ' + c.reranker.model : '⚠ реранкер ' + c.reranker.model + ' не скачан: ollama pull ' + c.reranker.model;
+      return c;
+    });
+  }
+  ['t-query', 't-rerank'].concat(TUNE.map(function (k) { return 't-' + k; })).forEach(function (id) {
+    $(id).addEventListener('input', tuneSummary);
+  });
+  $('t-reset').addEventListener('click', function () { if (rr.config) setTune(rr.config.improved); });
+
+  function renderFunnel(a) {
+    var box = $('ask-funnel');
+    if (!a || !a.funnel) { box.hidden = true; return; }
+    var f = a.funnel, c = f.counts, p = f.params;
+    box.hidden = false;
+    clear(box).appendChild(h('div', { class: 'panel__title', text: 'Как искал улучшенный RAG' }));
+    if (p.query !== 'raw') box.appendChild(h('div', null, h('span', { class: 'muted small mono', text: 'запрос для поиска (' + p.query + ', ' + f.ms.rewrite + ' мс):' }), h('div', { class: 'fq', text: f.query })));
+    box.appendChild(h('div', { class: 'fcounts' },
+      h('span', null, 'кандидатов ', h('b', { text: c.before })), h('i', { text: '→' }),
+      h('span', null, 'cos ≥ ' + p.sim_min + ': ', h('b', { text: c.passed_sim })), h('i', { text: '→' }),
+      p.rerank ? [h('span', null, 'реранкер ≥ ' + p.rel_min + ': ', h('b', { text: c.passed_rel })), h('i', { text: '→' })] : null,
+      h('span', null, 'в модель ', h('b', { text: c.kept })),
+      h('span', { class: 'muted', text: 'поиск ' + f.ms.search + ' мс · реранкер ' + f.ms.rerank + ' мс' + (f.rerank_cached ? ' (из кэша ' + f.rerank_cached + ')' : '') })));
+    var tbl = h('table', { class: 't cand' }, h('tr', null, h('th', { text: '#' }), h('th', { text: 'отрывок' }), h('th', { text: 'косинус' }),
+      h('th', { text: 'реранкер' }), h('th', { text: 'итог' })));
+    f.candidates.forEach(function (x) {
+      var hit = askQuestion && x.chapters.some(function (n) { return askQuestion.chapters.indexOf(n) !== -1; });
+      tbl.appendChild(h('tr', { class: x.stage, 'data-final': x.final || '' },
+        h('td', { class: 'num', text: x.rank }),
+        h('td', null, (hit ? '✔ ' : '') + x.section, h('div', { class: 'muted small', text: x.chunk_id })),
+        h('td', { class: 'num', text: x.cos.toFixed(3) }),
+        h('td', { class: 'num' }, x.rel == null ? '—' : [h('span', { class: 'relbar' }, h('i', { style: 'width:' + Math.round(x.rel * 100) + '%' })), x.rel.toFixed(2)]),
+        h('td', null, h('span', { class: 'stage ' + x.stage, text: x.stage === 'kept' ? '[' + x.final + '] в модель' : x.stage === 'top' ? 'не вошёл в top' : x.stage === 'sim' ? 'косинус' : 'реранкер' }),
+          ' ', h('span', { class: 'muted small', text: x.reason }))));
+    });
+    box.appendChild(tbl);
+  }
+
   function renderExpected() {
     var box = clear($('ask-expected'));
     if (!askQuestion) return;
@@ -599,14 +681,14 @@
     document.querySelectorAll('#ask-examples .chip').forEach(function (c) { c.classList.toggle('on', !!askQuestion && c.textContent === askQuestion.q); });
     renderExpected();
     var ans = clear($('answers'));
-    ans.appendChild(answerPanel('plain', null));
-    ans.appendChild(answerPanel('rag', null));
+    ['plain', 'rag', 'rag2'].forEach(function (k) { ans.appendChild(answerPanel(k, null)); });
     $('ask-sources').hidden = true;
+    $('ask-funnel').hidden = true;
     $('ask-btn').disabled = true;
-    api('/api/ask', { q: q, model: models.current, k: +$('ask-k').value }).then(function (r) {
+    api('/api/ask', { q: q, model: models.current, k: +$('ask-k').value, params: tuneParams() }).then(function (r) {
       clear(ans);
-      ans.appendChild(answerPanel('plain', r.plain));
-      ans.appendChild(answerPanel('rag', r.rag));
+      ['plain', 'rag', 'rag2'].forEach(function (k) { ans.appendChild(answerPanel(k, r[k])); });
+      renderFunnel(r.rag2);
       renderSources(r.rag);
     }).catch(function (e) {
       clear(ans).appendChild(h('div', { class: 'empty', text: e.message }));
@@ -621,7 +703,7 @@
 
   loaders.ask = function () {
     renderFlow();
-    Promise.all([loadModels(), loadRagQuestions()]).then(function () {
+    Promise.all([loadModels(), loadRagQuestions(), loadTune()]).then(function () {
       var box = clear($('ask-examples'));
       ragQuestions.forEach(function (q) {
         box.appendChild(h('button', { class: 'chip', type: 'button', text: q.q, onclick: function () { askQuestion = q; $('ask-q').value = q.q; runAsk(); } }));
@@ -632,6 +714,8 @@
 
   // ═════════════ 06 КАЧЕСТВО ═════════════
   var evalAfter = 0, evalPoll = null;
+
+  function yesNo(v) { return v ? h('span', { class: 'verdict v-верно', text: 'да' }) : h('span', { class: 'verdict v-неверно', text: 'нет' }); }
 
   function verdictChip(v) { return h('span', { class: 'verdict v-' + (v || 'none'), text: v || '—' }); }
 
@@ -651,16 +735,25 @@
     box.appendChild(h('div', { class: 'score' },
       h('div', { class: 'score__card p' }, h('div', { class: 'stat__k', text: 'без RAG — верно' }), h('div', { class: 'score__big', text: t.plain['верно'] + ' / ' + n }),
         stack(t.plain, n), h('div', { class: 'muted small', text: 'частично ' + t.plain['частично'] + ' · неверно ' + t.plain['неверно'] })),
-      h('div', { class: 'score__card r' }, h('div', { class: 'stat__k', text: 'с RAG — верно' }), h('div', { class: 'score__big', text: t.rag['верно'] + ' / ' + n }),
+      h('div', { class: 'score__card r' }, h('div', { class: 'stat__k', text: 'RAG — верно' }), h('div', { class: 'score__big', text: t.rag['верно'] + ' / ' + n }),
         stack(t.rag, n), h('div', { class: 'muted small', text: 'частично ' + t.rag['частично'] + ' · неверно ' + t.rag['неверно'] })),
-      h('div', { class: 'score__card s' }, h('div', { class: 'stat__k', text: 'нужная глава в отрывках' }), h('div', { class: 'score__big', text: t.chapter_hit + ' / ' + t.with_source }),
-        h('div', { class: 'muted small', text: 'проверка кодом, без судьи; вопрос-ловушка не считается' }))));
+      t.rag2 ? h('div', { class: 'score__card g' }, h('div', { class: 'stat__k', text: 'RAG + rerank — верно' }), h('div', { class: 'score__big', text: t.rag2['верно'] + ' / ' + n }),
+        stack(t.rag2, n), h('div', { class: 'muted small', text: 'частично ' + t.rag2['частично'] + ' · неверно ' + t.rag2['неверно'] })) : null,
+      h('div', { class: 'score__card s' }, h('div', { class: 'stat__k', text: 'нужная глава в отрывках' }),
+        h('div', { class: 'score__big', text: t.chapter_hit + (t.chapter_hit2 != null ? ' → ' + t.chapter_hit2 : '') + ' / ' + t.with_source }),
+        h('div', { class: 'muted small', text: 'RAG → RAG + rerank; проверка кодом, без судьи; ловушка не считается' }))));
+    if (res.params2) {
+      var p = res.params2;
+      box.appendChild(h('div', { class: 'muted small mono', style: 'margin-top:8px', text: 'воронка RAG + rerank: ' + p.query + ' · top-' + p.k_before +
+        ' → cos ≥ ' + p.sim_min + (p.rerank ? ' → реранкер ≥ ' + p.rel_min : '') + ' → top-' + p.k_after }));
+    }
   }
 
   function renderQTable(res) {
     var box = clear($('q-table'));
     var tbl = h('table', { class: 't qa' }, h('tr', null, h('th', { text: 'вопрос' }), h('th', { text: 'ожидание · источник' }),
-      h('th', { style: 'color:var(--plain)', text: 'без RAG' }), h('th', { style: 'color:var(--structure)', text: 'с RAG' }), h('th', { text: 'глава в отрывках' })));
+      h('th', { style: 'color:var(--plain)', text: 'без RAG' }), h('th', { style: 'color:var(--structure)', text: 'RAG' }),
+      h('th', { style: 'color:var(--rr)', text: 'RAG + rerank' }), h('th', { text: 'глава в отрывках' })));
     ragQuestions.forEach(function (q) {
       var it = res && res.items[q.id];
       function cell(mode) {
@@ -672,8 +765,10 @@
       tbl.appendChild(h('tr', null,
         h('td', null, q.q, q.verified ? null : h('div', { class: 'flag warn', text: 'не подтверждён текстом' })),
         h('td', { class: 'exp' }, q.expected, h('div', { class: 'muted small', style: 'margin-top:4px', text: q.chapters.length ? q.sources.join(', ') : 'источника нет (ловушка)' })),
-        cell('plain'), cell('rag'),
-        h('td', { class: 'num' }, !it || it.chapter_hit == null ? '—' : it.chapter_hit ? h('span', { class: 'verdict v-верно', text: 'да' }) : h('span', { class: 'verdict v-неверно', text: 'нет' }))));
+        cell('plain'), cell('rag'), cell('rag2'),
+        h('td', { class: 'num' }, !it || it.chapter_hit == null ? '—' : [yesNo(it.chapter_hit), it.chapter_hit2 != null ? [' → ', yesNo(it.chapter_hit2)] : null,
+          it.rag2 && it.rag2.counts ? h('div', { class: 'muted small', text: 'отрывков ' + it.rag2.counts.kept }) : null],
+          it && it.chapter_hit == null && it.rag2 && it.rag2.counts ? h('div', { class: 'muted small', text: 'отрывков ' + it.rag2.counts.kept }) : null)));
     });
     box.appendChild(tbl);
   }
@@ -694,7 +789,8 @@
         box.appendChild(h('div', { class: 'run', 'data-model': r.model, onclick: function () { showResult(r.model); } },
           h('div', null, r.model, h('br'), h('small', { text: 'судья ' + r.judge })),
           h('div', { style: 'text-align:right' }, h('span', { style: 'color:var(--plain)', text: t.plain['верно'] }), ' → ',
-            h('span', { style: 'color:var(--structure)', text: t.rag['верно'] }), h('small', { text: ' из ' + t.questions }))));
+            h('span', { style: 'color:var(--structure)', text: t.rag['верно'] }),
+            t.rag2 ? [' → ', h('span', { style: 'color:var(--rr)', text: t.rag2['верно'] })] : null, h('small', { text: ' из ' + t.questions }))));
       });
       return showResult(models.current);
     });
@@ -733,6 +829,196 @@
       loadRuns();
       api('/api/rag/eval/status?after=0').then(function (s) { if (s.state === 'running' && !evalPoll) { $('btn-eval').disabled = true; evalPoll = setInterval(pollEval, 1500); } });
     });
+  };
+
+  // ═════════════ 07 РЕРАНКИНГ ═════════════
+  var rrReport = null, rrAfter = 0, rrPoll = null;
+  var QM = { raw: 'вопрос как есть', en: 'перевод (en)', hyde: 'HyDE' };
+
+  // та же воронка, что rerank.funnel на сервере, — по сохранённым кандидатам
+  function rrApply(cands, cfg) {
+    var pool = cands.slice(0, cfg.k_before).filter(function (c) { return c.cos >= cfg.sim_min; });
+    if (cfg.rerank) {
+      pool = pool.filter(function (c) { return c.rel >= cfg.rel_min; });
+      pool = pool.slice().sort(function (a, b) { return b.rel - a.rel; });
+    }
+    return pool.slice(0, cfg.k_after);
+  }
+
+  function rrMetrics(data, cfg) {
+    var ans = data.filter(function (d) { return d.chapters.length; }), no = data.filter(function (d) { return !d.chapters.length; });
+    var m = { hit1: 0, hitk: 0, prec: 0, kept: 0, empty: 0 };
+    ans.forEach(function (d) {
+      var kept = rrApply(d.modes[cfg.query], cfg);
+      var ok = function (c) { return c.chapters.some(function (n) { return d.chapters.indexOf(n) !== -1; }); };
+      var good = kept.filter(ok);
+      m.hit1 += kept.length && ok(kept[0]) ? 1 : 0;
+      m.hitk += good.length ? 1 : 0;
+      m.prec += kept.length ? good.length / kept.length : 0;
+      m.kept += kept.length;
+      m.empty += kept.length ? 0 : 1;
+    });
+    Object.keys(m).forEach(function (k) { m[k] = m[k] / (ans.length || 1); });
+    var nk = no.map(function (d) { return rrApply(d.modes[cfg.query], cfg).length; });
+    m.no_empty = nk.filter(function (x) { return !x; }).length / (nk.length || 1);
+    m.no_kept = nk.reduce(function (a, b) { return a + b; }, 0) / (nk.length || 1);
+    return m;
+  }
+
+  var RR_COLS = [['hit1', 'hit@1', pct, 1], ['hitk', 'hit@K', pct, 1], ['prec', 'точность контекста', pct, 1],
+    ['kept', 'отрывков в модель', function (x) { return x.toFixed(1); }, 0], ['empty', 'пустой контекст (с ответом)', pct, -1],
+    ['no_empty', 'пустой контекст (без ответа)', pct, 1], ['no_kept', 'отрывков (без ответа)', function (x) { return x.toFixed(1); }, -1]];
+
+  function rrTable(rows, bestId) {
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'режим' }), RR_COLS.map(function (c) { return h('th', { style: 'text-align:right', text: c[1] }); })));
+    var best = {};
+    RR_COLS.forEach(function (c) {
+      if (!c[3]) return;
+      var vals = rows.map(function (r) { return r[c[0]]; });
+      best[c[0]] = c[3] > 0 ? Math.max.apply(null, vals) : Math.min.apply(null, vals);
+    });
+    rows.forEach(function (r) {
+      tbl.appendChild(h('tr', { class: r.id === bestId ? 'best' : '' }, h('td', null, r.title, r.cfg ? h('div', { class: 'muted small mono', text: cfgText(r.cfg) }) : null),
+        RR_COLS.map(function (c) { return h('td', { class: 'num' + (c[3] && r[c[0]] === best[c[0]] ? ' win' : ''), text: c[2](r[c[0]]) }); })));
+    });
+    return tbl;
+  }
+
+  function cfgText(c) {
+    return c.query + ' · top-' + c.k_before + (c.sim_min > -1 ? ' → cos ≥ ' + c.sim_min : '') + (c.rerank ? ' → rel ≥ ' + c.rel_min : '') + ' → top-' + c.k_after;
+  }
+
+  function rrSweepChart(query) {
+    var data = rrReport.questions, W = 560, H = 230, pad = 34, els = [];
+    var pts = [];
+    for (var i = 0; i < 20; i++) {
+      var t = Math.round(i * 5) / 100;
+      pts.push({ t: t, m: rrMetrics(data, { query: query, rerank: true, k_before: 20, sim_min: -1, rel_min: t, k_after: 5 }) });
+    }
+    var x = function (t) { return pad + t / 0.95 * (W - pad * 2); }, y = function (v) { return H - pad - v * (H - pad - 14); };
+    [0, .25, .5, .75, 1].forEach(function (v) {
+      els.push(sv('line', { x1: pad, x2: W - pad, y1: y(v), y2: y(v), stroke: cssVar('--line'), 'stroke-dasharray': v ? '2 4' : '' }));
+      els.push(sv('text', { x: pad - 6, y: y(v) + 3, 'text-anchor': 'end' }, Math.round(v * 100)));
+    });
+    [0, .2, .4, .6, .8].forEach(function (t) { els.push(sv('text', { x: x(t), y: H - 12, 'text-anchor': 'middle' }, t.toFixed(1))); });
+    els.push(sv('text', { x: W - pad, y: H - 12, 'text-anchor': 'end' }, 'порог реранкера →'));
+    var lines = [['hitk', cssVar('--structure'), 'hit@K'], ['prec', cssVar('--rr'), 'точность'], ['no_empty', cssVar('--plain'), 'пусто на «нет ответа»'], ['empty', cssVar('--err'), 'пусто на вопросах с ответом']];
+    lines.forEach(function (l, li) {
+      els.push(sv('polyline', { points: pts.map(function (p) { return x(p.t) + ',' + y(p.m[l[0]]); }).join(' '), fill: 'none', stroke: l[1], 'stroke-width': 2 }));
+      pts.forEach(function (p) {
+        var c = sv('circle', { cx: x(p.t), cy: y(p.m[l[0]]), r: 2.5, fill: l[1] });
+        c.appendChild(sv('title', {}, l[2] + ' при пороге ' + p.t + ': ' + Math.round(p.m[l[0]] * 100) + '%'));
+        els.push(c);
+      });
+      els.push(sv('rect', { x: pad + li * 128, y: 0, width: 10, height: 4, fill: l[1] }));
+      els.push(sv('text', { x: pad + li * 128 + 14, y: 6 }, l[2]));
+    });
+    var cur = +$('rl-rel_min').value;
+    els.push(sv('line', { x1: x(cur), x2: x(cur), y1: 12, y2: H - pad, stroke: cssVar('--text'), 'stroke-dasharray': '3 3' }));
+    var rec = rrReport.recommended;
+    if (rec.query === query) els.push(sv('line', { x1: x(rec.rel_min), x2: x(rec.rel_min), y1: 12, y2: H - pad, stroke: cssVar('--rr'), 'stroke-width': 1, opacity: .6 }));
+    return h('div', null, svg(W, H, els), h('div', { class: 'muted small', text: 'Режим запроса: ' + QM[query] + ', top-20 → реранкер → top-5. Пунктир — текущий порог, зелёная линия — рекомендованный.' }));
+  }
+
+  function rrLiveCfg() {
+    var c = { query: $('rl-query').value, rerank: $('rl-rerank').checked, k_before: +$('rl-k_before').value,
+      sim_min: +$('rl-sim_min').value, rel_min: +$('rl-rel_min').value, k_after: +$('rl-k_after').value };
+    ['k_before', 'sim_min', 'rel_min', 'k_after'].forEach(function (k) { $('rv-' + k).textContent = c[k]; });
+    return c;
+  }
+
+  function rrRenderLive() {
+    var cfg = rrLiveCfg();
+    var m = rrMetrics(rrReport.questions, cfg);
+    var base = rrReport.summary.filter(function (r) { return r.id === 'base'; })[0];
+    clear($('rr-live-out')).appendChild(rrTable([
+      Object.assign({ id: 'base', title: 'Базовый (День 22)', cfg: base.cfg }, base),
+      Object.assign({ id: 'live', title: 'Ваши настройки', cfg: cfg }, m)], 'live'));
+    clear($('rr-sweep')).appendChild(rrSweepChart(cfg.rerank ? cfg.query : rrReport.recommended.query));
+    rrNoAnswer(cfg);
+  }
+
+  function rrNoAnswer(cfg) {
+    var box = clear($('rr-noans'));
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'вопрос' }), h('th', { style: 'text-align:right', text: 'базовый: отрывков' }),
+      h('th', { style: 'text-align:right', text: 'ваши настройки: отрывков' }), h('th', { text: 'что всё же прошло (оценка реранкера)' })));
+    rrReport.questions.filter(function (d) { return !d.chapters.length; }).forEach(function (d) {
+      var kept = rrApply(d.modes[cfg.query], cfg);
+      tbl.appendChild(h('tr', null, h('td', { text: d.q }), h('td', { class: 'num', text: 5 }),
+        h('td', { class: 'num' }, kept.length ? String(kept.length) : h('span', { class: 'verdict v-верно', text: '0 — честный отказ' })),
+        h('td', { class: 'muted small', text: kept.map(function (c) { return c.section + ' (' + c.rel.toFixed(2) + ')'; }).join('; ') })));
+    });
+    box.appendChild(tbl);
+  }
+
+  function rrBuildLive() {
+    var rec = rrReport.recommended;
+    var box = clear($('rr-live'));
+    var sel = h('select', { id: 'rl-query' }, ['raw', 'en', 'hyde'].map(function (q) { return h('option', { value: q, text: QM[q] }); }));
+    box.appendChild(h('div', { class: 'live' },
+      h('label', null, 'запрос', sel),
+      h('label', null, h('span', null, 'top-K до ', h('b', { id: 'rv-k_before' })), h('input', { type: 'range', id: 'rl-k_before', min: 5, max: 20, step: 1, value: 20 })),
+      h('label', null, h('span', null, 'порог косинуса ', h('b', { id: 'rv-sim_min' })), h('input', { type: 'range', id: 'rl-sim_min', min: 0, max: 0.6, step: 0.01, value: rec.sim_min > 0 ? rec.sim_min : 0 })),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'rl-rerank', checked: 'checked' }), 'реранкер'),
+      h('label', null, h('span', null, 'порог реранкера ', h('b', { id: 'rv-rel_min' })), h('input', { type: 'range', id: 'rl-rel_min', min: 0, max: 0.95, step: 0.05, value: rec.rel_min })),
+      h('label', null, h('span', null, 'top-K после ', h('b', { id: 'rv-k_after' })), h('input', { type: 'range', id: 'rl-k_after', min: 1, max: 10, step: 1, value: 5 }))));
+    box.appendChild(h('div', { id: 'rr-live-out' }));
+    box.appendChild(h('div', { class: 'controls', style: 'margin-top:10px' }, h('button', { class: 'btn', type: 'button', text: 'использовать в «Вопрос · RAG» →', onclick: function () {
+      var c = rrLiveCfg(); loadTune().then(function () { setTune(c); show('ask'); });
+    } })));
+    sel.value = rec.query;
+    box.querySelectorAll('input, select').forEach(function (e) { e.addEventListener('input', rrRenderLive); });
+    rrRenderLive();
+  }
+
+  function rrRender() {
+    var r = rrReport;
+    if (!r) { clear($('rr-table')).appendChild(h('div', { class: 'empty', text: 'Эксперимента ещё нет — нажмите «Запустить эксперимент» (≈10 минут на GTX 1050 Ti).' })); return; }
+    $('rr-meta').textContent = new Date(r.finished * 1000).toLocaleString('ru-RU') + ' · ' + r.seconds + ' с · реранкер ' + r.rerank_model;
+    clear($('rr-rec')).appendChild(kv([['запрос', QM[r.recommended.query]], ['порог косинуса', r.recommended.sim_min > -1 ? r.recommended.sim_min : 'нет'], ['порог реранкера', r.recommended.rel_min],
+      ['top-K до → после', r.k_pool + ' → 5'], ['вопросов', r.questions.length + ' (без ответа: ' + r.questions.filter(function (d) { return !d.chapters.length; }).length + ')'],
+      ['rewrite', r.rewrite_model]]));
+    $('rr-thr').textContent = 'пороги в режимах с фильтром: косинус ≥ ' + r.recommended.sim_min + ', реранкер ≥ ' + r.recommended.rel_min;
+    var bestId = r.recommended.query === 'raw' ? 'filter' : r.recommended.query + '-filter';
+    clear($('rr-table')).appendChild(rrTable(r.summary, bestId));
+    rrBuildLive();
+  }
+
+  function rrLoad() {
+    return api('/api/experiment/report').then(function (d) { rrReport = d.report; rrRender(); });
+  }
+
+  function rrPollFn() {
+    api('/api/experiment/status?after=' + rrAfter).then(function (s) {
+      var con = $('rr-console');
+      if (rrAfter === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      rrAfter += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('rr-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') return;
+      clearInterval(rrPoll); rrPoll = null;
+      $('btn-rr').disabled = false;
+      if (s.state === 'done') { $('rr-bar').style.width = '100%'; rrLoad(); }
+    }).catch(function () {});
+  }
+
+  $('btn-rr').addEventListener('click', function () {
+    rrAfter = 0; clear($('rr-console'));
+    api('/api/experiment', { model: models.current }).then(function (r) {
+      $('btn-rr').disabled = true;
+      if (!rrPoll) rrPoll = setInterval(rrPollFn, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.rerank = function () {
+    var box = clear($('rr-flow'));
+    [['r', 'вопрос'], ['', '→'], ['g', 'rewrite: raw / en / HyDE'], ['', '→'], ['r', 'bge-m3: top-20'], ['', '→'], ['g', 'фильтр: косинус ≥ порог'], ['', '→'],
+     ['g', 'Qwen3-Reranker: P(yes)'], ['', '→'], ['g', 'фильтр: оценка ≥ порог'], ['', '→'], ['r', 'top-5 → LLM']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' ? h('i', { text: '→' }) : h('span', { class: x[0], text: x[1] })); });
+    loadModels().then(function () { $('rr-model').textContent = models.current; });
+    rrLoad();
+    api('/api/experiment/status?after=0').then(function (s) { if (s.state === 'running' && !rrPoll) { $('btn-rr').disabled = true; rrPoll = setInterval(rrPollFn, 1500); } });
   };
 
   loadModels().catch(function () {});

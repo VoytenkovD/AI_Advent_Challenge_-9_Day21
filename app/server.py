@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analysis
 import chunking
 import embed
+import experiment
 import indexer
 import llm
 import rag
+import rerank
 import store
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -80,6 +82,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._guard(llm.catalog)
         if path == "/api/rag/questions":
             return self._guard(lambda: {"questions": rag.load_questions(), "strategy": rag.STRATEGY, "k": rag.TOP_K})
+        if path == "/api/rerank/config":
+            return self._guard(lambda: {"base": rerank.BASE, "improved": rerank.IMPROVED, "limits": rerank.LIMITS,
+                                        "query_modes": rerank.QUERY_MODES, "reranker": rerank.status()})
+        if path == "/api/experiment/status":
+            return self._guard(lambda: experiment.JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/experiment/report":
+            return self._guard(lambda: {"report": experiment.load_report()})
         if path == "/api/rag/eval/status":
             return self._guard(lambda: rag.EVAL_JOB.snapshot(int(arg("after", 0))))
         if path == "/api/rag/results":
@@ -119,7 +128,19 @@ class Handler(BaseHTTPRequestHandler):
             q = (data.get("q") or "").strip()
             if not q:
                 return self._json(400, {"error": "Пустой вопрос"})
-            return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K))))
+            modes = [m for m in (data.get("modes") or rag.MODES) if m in rag.MODES]
+            return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K)),
+                                               params=data.get("params"), modes=modes))
+        if path == "/api/rerank/funnel":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            return self._guard(lambda: rerank.funnel(q, rerank.params(data.get("params")), data.get("model") or llm.DEFAULT_MODEL))
+        if path == "/api/experiment":
+            data = self._body()
+            return self._guard(lambda: {"started": experiment.start(data.get("model") or llm.DEFAULT_MODEL),
+                                        "state": experiment.JOB.state})
         if path == "/api/rag/eval":
             data = self._body()
             def go():
