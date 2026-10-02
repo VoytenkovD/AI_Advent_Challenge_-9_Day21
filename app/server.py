@@ -16,6 +16,7 @@ import analysis
 import chunking
 import embed
 import experiment
+import grounded
 import indexer
 import llm
 import rag
@@ -82,6 +83,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._guard(llm.catalog)
         if path == "/api/rag/questions":
             return self._guard(lambda: {"questions": rag.load_questions(), "strategy": rag.STRATEGY, "k": rag.TOP_K})
+        if path == "/api/cite/config":
+            return self._guard(lambda: {"gate_min": grounded.GATE_MIN, "support_min": grounded.SUPPORT_MIN,
+                                        "fuzzy_min": grounded.FUZZY_MIN, "params": rerank.IMPROVED})
+        if path == "/api/cite/eval/status":
+            return self._guard(lambda: grounded.EVAL_JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/cite/results":
+            model = arg("model")
+            return self._guard(lambda: {"result": grounded.load_results(model)} if model else {"runs": grounded.list_results()})
         if path == "/api/rerank/config":
             return self._guard(lambda: {"base": rerank.BASE, "improved": rerank.IMPROVED, "limits": rerank.LIMITS,
                                         "query_modes": rerank.QUERY_MODES, "reranker": rerank.status()})
@@ -131,6 +140,18 @@ class Handler(BaseHTTPRequestHandler):
             modes = [m for m in (data.get("modes") or rag.MODES) if m in rag.MODES]
             return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K)),
                                                params=data.get("params"), modes=modes))
+        if path == "/api/cite/ask":
+            data = self._body()
+            q = (data.get("q") or "").strip()
+            if not q:
+                return self._json(400, {"error": "Пустой вопрос"})
+            return self._guard(lambda: grounded.answer(q, data.get("model") or llm.DEFAULT_MODEL, data.get("params"),
+                                                       float(data.get("gate_min", grounded.GATE_MIN)), data.get("judge")))
+        if path == "/api/cite/eval":
+            data = self._body()
+            return self._guard(lambda: {"started": grounded.start_eval(
+                data.get("model") or llm.DEFAULT_MODEL, data.get("judge"), data.get("params"),
+                float(data.get("gate_min", grounded.GATE_MIN))), "state": grounded.EVAL_JOB.state})
         if path == "/api/rerank/funnel":
             data = self._body()
             q = (data.get("q") or "").strip()

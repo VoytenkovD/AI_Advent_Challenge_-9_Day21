@@ -1021,6 +1021,200 @@
     api('/api/experiment/status?after=0').then(function (s) { if (s.state === 'running' && !rrPoll) { $('btn-rr').disabled = true; rrPoll = setInterval(rrPollFn, 1500); } });
   };
 
+  // ═════════════ 08 ЦИТАТЫ ═════════════
+  var ct = { config: null, after: 0, poll: null, question: null };
+  var BY = { gate: 'порог уверенности (до LLM)', model: 'модель сама сказала «нет ответа»',
+    verify: 'нет ни одной подтверждённой цитаты', meaning: 'цитаты не подтверждают смысл ответа' };
+  var QST = { exact: ['дословно', 'ok'], fuzzy: ['почти дословно → заменена текстом', 'warn'], moved: ['найдена в другом отрывке → источник исправлен', 'warn'], rejected: ['отклонена', 'bad'] };
+
+  function ctFlow() {
+    var box = clear($('ct-flow'));
+    [['g', 'воронка Дня 23'], ['', '→'], ['c', 'порог уверенности → «не знаю»'], ['', '→'], ['r', 'LLM: JSON {status, answer [n], quotes, clarify}'], ['', '→'],
+     ['c', 'цитаты ищутся в отрывках'], ['', '→'], ['c', 'источники строит код'], ['', '→'], ['c', 'смысл ответа ↔ цитаты'], ['', '→'], ['g', 'ответ или «не знаю»']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' ? h('i', { text: '→' }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  function chk(ok, text, warn) { return h('span', { class: 'chk ' + (ok ? 'ok' : warn ? 'warn' : 'bad'), text: (ok ? '✓ ' : warn ? '~ ' : '✗ ') + text }); }
+
+  function quoteCard(q, a) {
+    var src = (a.context || []).filter(function (s) { return s.n === q.source; })[0];
+    var st = QST[q.status] || ['?', ''];
+    var card = h('div', { class: 'quote' + (q.status === 'rejected' ? ' rejected' : '') },
+      h('div', { class: 'quote__text', text: '«' + (q.quote || q.quote_model) + '»' }),
+      h('div', { class: 'quote__meta' },
+        q.source ? h('span', { class: 'cite', text: q.source }) : null,
+        h('span', { text: q.section || (src && src.section) || '' }), h('span', { text: q.chunk_id || '' }),
+        h('span', { class: 'chk ' + st[1], text: st[0] + (q.status === 'fuzzy' ? ' (' + Math.round(q.ratio * 100) + '%)' : '') }),
+        q.status === 'rejected' ? h('span', { text: q.reason || '' }) : null,
+        q.status !== 'fuzzy' && q.status !== 'moved' || !q.quote_model || q.quote_model === q.quote ? null : h('span', { title: q.quote_model, text: 'у модели было: «' + q.quote_model.slice(0, 60) + '…»' })));
+    if (src && q.start != null) {
+      var ctx = h('div', { class: 'qctx' });
+      var from = Math.max(0, q.start - 300), to = Math.min(src.text.length, q.end + 300);
+      ctx.appendChild(document.createTextNode((from ? '…' : '') + src.text.slice(from, q.start)));
+      ctx.appendChild(h('mark', { text: src.text.slice(q.start, q.end) }));
+      ctx.appendChild(document.createTextNode(src.text.slice(q.end, to) + (to < src.text.length ? '…' : '')));
+      card.appendChild(ctx);
+      card.title = 'клик — показать цитату в тексте отрывка';
+      card.addEventListener('click', function () { card.classList.toggle('open'); });
+    }
+    return card;
+  }
+
+  function ctRender(a) {
+    var box = clear($('ct-result'));
+    var p = h('div', { class: 'panel' });
+    var answered = a.status !== 'unknown';
+    var js = a.judge_support;
+    p.appendChild(h('div', { class: 'verdictbar' },
+      h('span', { class: 'status ' + a.status, text: a.status === 'answered' ? 'ОТВЕТ С ДОКАЗАТЕЛЬСТВАМИ' : a.status === 'quotes' ? 'ОТВЕТ ЦИТАТАМИ' : 'НЕ ЗНАЮ' }),
+      a.status === 'answered' ? null : h('span', { class: 'muted small mono', text: 'причина: ' + BY[a.by] + (a.quote_rel != null ? ' · цитаты отвечают на вопрос: ' + a.quote_rel.toFixed(2) : '') }),
+      h('div', { class: 'checks' },
+        chk(a.sources.length, 'источники: ' + a.sources.length),
+        chk(a.quotes.length, 'цитаты: ' + a.quotes.length + (a.rejected.length ? ' (+' + a.rejected.length + ' отклонено)' : '')),
+        js ? chk(js.verdict === 'да', 'смысл ↔ цитаты: ' + js.verdict, js.verdict === 'частично') : null,
+        a.support != null ? chk(a.support_ok, 'по теме (реранкер): ' + a.support.toFixed(2)) : null,
+        chk(a.best_rel >= a.gate_min, 'уверенность ' + a.best_rel.toFixed(2) + ' / порог ' + a.gate_min)),
+      h('span', { class: 'muted small mono', style: 'margin-left:auto', text: (a.latency_ms / 1000).toFixed(1) + ' с' })));
+    p.appendChild(a.status === 'answered' ? withCites(a.answer, function (n) {
+      var el = document.querySelector('#ct-result .cite-src[data-n="' + n + '"]'); if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    }) : h('div', { class: 'ct-answer', text: a.answer }));
+    if (a.status === 'answered') p.lastChild.classList.add('ct-answer');
+    if (a.unverified_answer) p.appendChild(h('div', { class: 'ct-unver' }, h('b', { text: 'НЕ ВЫДАН — ответ модели: ' }), a.unverified_answer));
+    if (js && js.reason) p.appendChild(h('div', { class: 'muted small', style: 'margin-bottom:10px', text: 'судья: ' + js.reason }));
+    if (a.clarify) p.appendChild(h('div', { class: 'expected' }, h('b', { text: 'уточните' }), a.clarify));
+    if (!answered && a.clarify_hints && a.clarify_hints.length) {
+      p.appendChild(h('div', { class: 'muted small', text: 'Похоже, вопрос о главах:' }));
+      p.appendChild(h('div', { class: 'ct-hints' }, a.clarify_hints.map(function (s) { return h('span', { class: 'chip', text: s }); })));
+    }
+    box.appendChild(p);
+    if (a.sources.length) {
+      var t = h('table', { class: 't srcs' }, h('tr', null, h('th', { text: '[n]' }), h('th', { text: 'source' }), h('th', { text: 'section' }), h('th', { text: 'chunk_id' }), h('th', { text: 'реранкер' })));
+      a.sources.forEach(function (s) {
+        t.appendChild(h('tr', { class: 'cite-src', 'data-n': s.n }, h('td', null, h('span', { class: 'cite', text: s.n })), h('td', { class: 'mono', text: s.source }),
+          h('td', { text: s.section }), h('td', { class: 'mono', text: s.chunk_id }), h('td', { class: 'num', text: s.rel == null ? '—' : s.rel.toFixed(2) })));
+      });
+      box.appendChild(h('div', { class: 'panel' }, h('div', { class: 'panel__title', text: 'Источники (собраны кодом по подтверждённым цитатам и ссылкам [n])' }), t));
+    }
+    var qs = a.quotes.concat(a.rejected);
+    if (qs.length) {
+      box.appendChild(h('div', { class: 'panel' }, h('div', { class: 'panel__title', text: 'Цитаты — проверены по тексту отрывков (клик — показать в контексте)' }),
+        qs.map(function (q) { return quoteCard(q, a); })));
+    }
+  }
+
+  function ctAsk() {
+    var q = $('ct-q').value.trim();
+    if (!q) return;
+    if (ct.question && ct.question.q !== q) ct.question = null;
+    var ex = clear($('ct-expected'));
+    if (ct.question) ex.appendChild(h('div', { class: 'expected' }, h('b', { text: 'ожидание' }), ct.question.expected,
+      h('div', { class: 'muted small', style: 'margin-top:4px', text: 'источник: ' + (ct.question.chapters.length ? ct.question.sources.join(', ') : 'нет — правильно ответить «не знаю»') })));
+    clear($('ct-result')).appendChild(h('div', { class: 'panel thinking', text: 'ищу, отвечаю, проверяю цитаты' }));
+    $('ct-btn').disabled = true;
+    api('/api/cite/ask', { q: q, model: models.current, judge: $('ct-judge').value, params: tuneParams ? (rr.config ? tuneParams() : null) : null, gate_min: +$('ct-gate').value })
+      .then(ctRender).catch(function (e) { clear($('ct-result')).appendChild(h('div', { class: 'empty', text: e.message })); })
+      .finally(function () { $('ct-btn').disabled = false; });
+  }
+  $('ct-form').addEventListener('submit', function (e) { e.preventDefault(); ctAsk(); });
+
+  // ── проверка на 10 вопросах ──
+  function ctTotals(r) {
+    var box = clear($('ct-totals'));
+    $('ct-run-meta').textContent = r ? r.model + ' · судья ' + r.judge + ' · порог «не знаю» ' + r.gate_min + ' · ' + new Date(r.finished * 1000).toLocaleString('ru-RU') : '';
+    if (!r) { box.appendChild(h('div', { class: 'empty', text: 'Проверки для этой модели ещё нет — нажмите «Запустить проверку».' })); return; }
+    var t = r.totals;
+    function card(cls, k, big, sub) { return h('div', { class: 'score__card ' + cls }, h('div', { class: 'stat__k', text: k }), h('div', { class: 'score__big', text: big }), h('div', { class: 'muted small', text: sub })); }
+    box.appendChild(h('div', { class: 'score' },
+      card('g', 'ответов с источниками', t.with_sources + ' / ' + t.answered, 'по существу ' + (t.answered - (t.quote_answers || 0)) + ', цитатами ' + (t.quote_answers || 0) + '; «не знаю»: ' + t.unknown),
+      card('g', 'ответов с цитатами', t.with_quotes + ' / ' + t.answered, 'подтверждено цитат ' + t.quotes_ok + ' из ' + t.quotes + ', дословно ' + t.quotes_exact),
+      card('r', 'смысл ↔ цитаты (судья)', t.judge_support['да'] + ' / ' + t.answered, 'частично ' + t.judge_support['частично'] + ' · нет ' + t.judge_support['нет'] + '; отклонено по смыслу ' + t.meaning_rejected),
+      card('s', 'верно по эталону', t.correct['верно'] + ' / ' + t.questions, 'частично ' + t.correct['частично'] + ' · неверно ' + t.correct['неверно']),
+      card('p', '«не знаю» на ловушке', t.trap_unknown + ' / ' + t.traps, 'лишних «не знаю» на вопросах с ответом: ' + t.false_unknown)));
+  }
+
+  function ctTable(r) {
+    var box = clear($('ct-table'));
+    if (!r) return;
+    var tbl = h('table', { class: 't qa' }, h('tr', null, h('th', { text: 'вопрос · ожидание' }), h('th', { text: 'ответ' }), h('th', { text: 'источники' }),
+      h('th', { text: 'цитаты' }), h('th', { text: 'смысл ↔ цитаты' }), h('th', { text: 'верно?' })));
+    Object.keys(r.items).forEach(function (id) {
+      var v = r.items[id], js = v.judge_support;
+      tbl.appendChild(h('tr', null,
+        h('td', { class: 'exp' }, v.q, h('div', { class: 'muted small', style: 'margin-top:4px', text: v.expected })),
+        h('td', { class: 'ans' }, h('span', { class: 'status ' + v.status, style: 'font-size:10.5px;padding:1px 6px', text: v.status === 'answered' ? 'ответ' : v.status === 'quotes' ? 'цитатами' : 'не знаю' }), ' ',
+          v.answer, v.status !== 'answered' ? h('div', { class: 'reason', text: BY[v.by] }) : null,
+          v.unverified_answer ? h('div', { class: 'reason', text: 'не выдан: ' + v.unverified_answer }) : null),
+        h('td', { class: 'small' }, v.sources.length ? v.sources.map(function (s) { return h('div', { text: '[' + s.n + '] ' + s.section }); }) : '—'),
+        h('td', { class: 'small' }, v.quotes.length + v.rejected.length ? [h('div', { text: v.quotes.length + ' подтв. / ' + v.rejected.length + ' откл.' }),
+          v.quotes.slice(0, 1).map(function (q) { return h('div', { class: 'muted', style: 'font-style:italic', text: '«' + q.quote.slice(0, 90) + '…»' }); })] : '—'),
+        h('td', null, js ? [h('span', { class: 'verdict ' + (js.verdict === 'да' ? 'v-верно' : js.verdict === 'частично' ? 'v-частично' : 'v-неверно'), text: js.verdict }),
+          h('div', { class: 'reason', text: js.reason })] : '—'),
+        h('td', null, verdictChip(v.judge_correct && v.judge_correct.verdict))));
+    });
+    box.appendChild(tbl);
+  }
+
+  function ctShow(model) {
+    return api('/api/cite/results?model=' + encodeURIComponent(model)).then(function (d) {
+      ctTotals(d.result); ctTable(d.result);
+      document.querySelectorAll('#ct-runs .run').forEach(function (r) { r.classList.toggle('on', r.dataset.model === model); });
+    });
+  }
+
+  function ctRuns() {
+    return api('/api/cite/results').then(function (d) {
+      var box = clear($('ct-runs'));
+      if (!d.runs.length) box.appendChild(h('div', { class: 'muted small', text: 'Проверок пока нет.' }));
+      d.runs.forEach(function (r) {
+        var t = r.totals;
+        box.appendChild(h('div', { class: 'run', 'data-model': r.model, onclick: function () { ctShow(r.model); } },
+          h('div', null, r.model, h('br'), h('small', { text: 'судья ' + r.judge })),
+          h('div', { style: 'text-align:right' }, h('span', { style: 'color:var(--rr)', text: t.with_quotes + '/' + t.answered }), h('small', { text: ' с цитатами' }))));
+      });
+      return ctShow(models.current);
+    });
+  }
+
+  function ctPoll() {
+    api('/api/cite/eval/status?after=' + ct.after).then(function (s) {
+      var con = $('ct-console');
+      if (ct.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      ct.after += s.log.length;
+      con.scrollTop = con.scrollHeight;
+      if (s.progress) $('ct-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state === 'running') { ctShow(models.current); return; }
+      clearInterval(ct.poll); ct.poll = null;
+      $('btn-ct-eval').disabled = false;
+      if (s.state === 'done') $('ct-bar').style.width = '100%';
+      ctRuns();
+    }).catch(function () {});
+  }
+
+  $('btn-ct-eval').addEventListener('click', function () {
+    ct.after = 0; clear($('ct-console')); $('ct-bar').style.width = '2%';
+    api('/api/cite/eval', { model: models.current, judge: $('ct-judge').value, gate_min: +$('ct-gate').value }).then(function () {
+      $('btn-ct-eval').disabled = true;
+      if (!ct.poll) ct.poll = setInterval(ctPoll, 1500);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.cite = function () {
+    ctFlow();
+    Promise.all([loadModels(), loadRagQuestions(), loadTune(),
+      ct.config ? Promise.resolve(ct.config) : api('/api/cite/config').then(function (c) { ct.config = c; $('ct-gate').value = c.gate_min; return c; })
+    ]).then(function () {
+      $('ct-model').textContent = models.current;
+      if (!$('ct-judge').options.length) fillModelSelect($('ct-judge'), lsGet('judge') || models.current);
+      var box = clear($('ct-examples'));
+      ragQuestions.forEach(function (q) {
+        box.appendChild(h('button', { class: 'chip', type: 'button', text: q.q, onclick: function () { ct.question = q; $('ct-q').value = q.q; ctAsk(); } }));
+      });
+      ctRuns();
+      api('/api/cite/eval/status?after=0').then(function (s) { if (s.state === 'running' && !ct.poll) { $('btn-ct-eval').disabled = true; ct.poll = setInterval(ctPoll, 1500); } });
+    });
+  };
+
   loadModels().catch(function () {});
 
   // ───────────── старт ─────────────

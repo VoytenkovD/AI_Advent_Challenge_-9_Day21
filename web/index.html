@@ -29,6 +29,7 @@
   <button class="tab" data-tab="ask" role="tab"><b>05</b> Вопрос · RAG</button>
   <button class="tab" data-tab="quality" role="tab"><b>06</b> Качество</button>
   <button class="tab" data-tab="rerank" role="tab"><b>07</b> Реранкинг</button>
+  <button class="tab" data-tab="cite" role="tab"><b>08</b> Цитаты</button>
   <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
@@ -161,6 +162,32 @@
       <div class="panel"><div class="panel__title">Порог реранкера → качество контекста</div><div id="rr-sweep"></div></div>
     </div>
     <div class="panel"><div class="panel__title">Вопросы без ответа: что фильтр пропустил в модель</div><div id="rr-noans"></div></div>
+  </section>
+
+  <!-- 08 ЦИТАТЫ -->
+  <section class="view" id="view-cite">
+    <div class="flow" id="ct-flow"></div>
+    <form class="searchbar" id="ct-form">
+      <input id="ct-q" autocomplete="off" placeholder="Вопрос о «Моби Дике»: ответ будет только с источниками и дословными цитатами">
+      <label class="model-pick inline" title="Порог уверенности: если лучшая оценка реранкера ниже — «не знаю»"><span>«не знаю» если &lt;</span><input type="number" id="ct-gate" min="0" max="1" step="0.05" style="width:64px;background:var(--panel);border:1px solid var(--line-2);border-radius:4px;padding:5px 6px;font-family:var(--mono)"></label>
+      <button class="btn btn--primary" type="submit" id="ct-btn">Спросить</button>
+    </form>
+    <div class="chips" id="ct-examples"></div>
+    <div id="ct-expected"></div>
+    <div id="ct-result"></div>
+
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Проверка на 10 контрольных вопросах</div>
+        <div class="muted small" style="margin-bottom:10px;">Для каждого вопроса: есть ли источники, есть ли цитаты и подтверждены ли они текстом, совпадает ли смысл ответа с цитатами (судья + кросс-энкодер), верен ли ответ по эталону, сработал ли «не знаю» на вопросе-ловушке.</div>
+        <div class="controls"><label class="model-pick inline"><span>отвечает</span><b id="ct-model"></b></label><label class="model-pick inline"><span>судья</span><select id="ct-judge"></select></label><button class="btn btn--primary" id="btn-ct-eval">▶ Запустить проверку</button></div>
+        <div class="progress"><div class="progress__bar" id="ct-bar"></div></div>
+        <div class="console console--short" id="ct-console"><div class="muted">Журнал проверки появится здесь.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Сохранённые проверки</div><div id="ct-runs"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Итог <span class="muted small" id="ct-run-meta"></span></div><div id="ct-totals"></div></div>
+    <div class="panel"><div class="panel__title">Вопросы</div><div id="ct-table"></div></div>
   </section>
 </main>
 

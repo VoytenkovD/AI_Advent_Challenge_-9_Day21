@@ -118,16 +118,16 @@ def rewrite(question, mode, model):
 INSTRUCTION = "Given a question about the novel Moby-Dick, retrieve passages of the novel that answer the question"
 
 
-def _prompt(query, doc):
+def _prompt(query, doc, instruction=INSTRUCTION):
     """Шаблон Qwen3-Reranker: ответ ассистента начинается с пустых рассуждений, следующий токен — yes или no."""
     return ("<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the "
             "Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
-            "<Instruct>: " + INSTRUCTION + "\n<Query>: " + query + "\n<Document>: " + doc +
+            "<Instruct>: " + instruction + "\n<Query>: " + query + "\n<Document>: " + doc +
             "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
-def _score_one(query, doc):
-    body = {"model": RERANK_MODEL, "prompt": _prompt(query, doc[:4000]), "raw": True, "stream": False,
+def _score_one(query, doc, instruction=INSTRUCTION):
+    body = {"model": RERANK_MODEL, "prompt": _prompt(query, doc[:4000], instruction), "raw": True, "stream": False,
             "logprobs": True, "top_logprobs": 20,
             "options": {"num_predict": 1, "temperature": 0, "num_ctx": 2048}}
     req = urllib.request.Request(embed.OLLAMA_URL + "/api/generate", data=json.dumps(body).encode("utf-8"),
@@ -170,6 +170,15 @@ def score(question, chunks):
     if fresh:
         _save_cache()
     return out, round((time.time() - t0) * 1000), len(chunks) - fresh
+
+
+SUPPORT_INSTRUCTION = ("Given a statement written in Russian about the novel Moby-Dick, judge whether the Document "
+                       "(verbatim quotes from the novel) supports the statement")
+
+
+def support(statement, quotes_text):
+    """Подтверждают ли цитаты утверждение: P(yes) того же кросс-энкодера с другой инструкцией."""
+    return round(_score_one(statement, quotes_text, SUPPORT_INSTRUCTION), 4)
 
 
 def status():

@@ -97,11 +97,13 @@ THINK_RE = re.compile(r"^.*?</think>\s*|<think>.*?</think>\s*", re.S)  # бло�
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))  # 5 отрывков ≈ 1500–2000 токенов; больше — не влезет в 4 ГБ видеопамяти
 
 
-def _chat_ollama(model, messages, temperature, max_tokens):
+def _chat_ollama(model, messages, temperature, max_tokens, schema=None):
     """Нативный /api/chat: в отличие от /v1 позволяет задать окно контекста (num_ctx).
     Через /v1 Ollama молча обрезает длинный промпт с отрывками до окна по умолчанию."""
     body = {"model": model, "messages": messages, "stream": False,
             "options": {"temperature": temperature, "num_ctx": NUM_CTX, "num_predict": max_tokens}}
+    if schema:
+        body["format"] = schema  # structured outputs: Ollama гарантирует JSON по схеме
     if model.startswith(("qwen3", "deepseek-r1")):
         # без рассуждений: быстрее, и ответ не съедает лимит токенов. Параметр think понимают не все
         # сборки модели, поэтому для Qwen3 дублируем мягким переключателем /no_think в последнем сообщении.
@@ -120,18 +122,26 @@ def _chat_ollama(model, messages, temperature, max_tokens):
     return data["message"].get("content") or "", data.get("prompt_eval_count", 0), data.get("eval_count", 0)
 
 
-def chat(full_model, messages, temperature=0.2, max_tokens=900):
-    """Один вызов модели. Возвращает {text, usage, latency_ms, model}."""
+def chat(full_model, messages, temperature=0.2, max_tokens=900, schema=None):
+    """Один вызов модели. Возвращает {text, usage, latency_ms, model}.
+    schema — JSON Schema ответа: у Ollama строгий формат, у остальных провайдеров — json_object
+    (если провайдер его не поддерживает, повторяем запрос без него; схема тогда описана в промпте)."""
     provider, model = split_model(full_model)
     t0 = time.time()
     if provider == "ollama":
-        text, p_tok, c_tok = _chat_ollama(model, messages, temperature, max_tokens)
+        text, p_tok, c_tok = _chat_ollama(model, messages, temperature, max_tokens, schema)
         return {"text": THINK_RE.sub("", text).strip(), "usage": {"prompt": p_tok, "completion": c_tok},
                 "latency_ms": round((time.time() - t0) * 1000), "model": full_model}
-    data = _request(provider, "/chat/completions", {
-        "model": model, "messages": messages, "temperature": temperature,
-        "max_tokens": max_tokens, "stream": False,
-    })
+    body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "stream": False}
+    if schema:
+        try:
+            data = _request(provider, "/chat/completions", dict(body, response_format={"type": "json_object"}))
+        except LlmError as e:
+            if " 400" not in str(e) and " 422" not in str(e):
+                raise
+            data = _request(provider, "/chat/completions", body)
+    else:
+        data = _request(provider, "/chat/completions", body)
     try:
         text = data["choices"][0]["message"].get("content") or ""
     except (KeyError, IndexError):
