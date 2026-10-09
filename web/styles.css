@@ -370,3 +370,18 @@ table.srcs td { font-size: 12.5px; }
 .sc-turns td { font-size: 12px; }
 .sc-turns td.msg { max-width: 260px; }
 .sc-turns td.rep { max-width: 360px; color: #c4d0ee; }
+/* ═════════════ День 28: локально vs облако ═════════════ */
+.lvc-model { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; border: 1px solid var(--line-2); border-radius: 4px; padding: 4px 9px; cursor: pointer; }
+.lvc-model input { accent-color: var(--structure); }
+.tag { font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 3px; border: 1px solid currentColor; white-space: nowrap; }
+.tag.local { color: var(--rr); } .tag.cloud { color: var(--plain); }
+.score__card.local { border-top-color: var(--rr); } .score__card.cloud { border-top-color: var(--plain); }
+.score__card .lvc-name { font-family: var(--mono); font-size: 13px; font-weight: 700; margin-bottom: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.score__card .lvc-rows { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.7; }
+.score__card .lvc-rows b { color: var(--text); font-weight: 600; }
+table.t td.grp { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; padding-top: 12px; }
+table.matrix td { font-size: 12px; vertical-align: middle; }
+table.matrix .runs { display: flex; gap: 3px; align-items: center; }
+table.matrix .dot { width: 18px; height: 18px; border-radius: 3px; display: inline-grid; place-items: center; font-size: 10px; font-family: var(--mono); color: #021018; cursor: help; }
+.dot.v-верно { background: var(--ok); } .dot.v-частично { background: var(--warn); } .dot.v-неверно { background: var(--err); } .dot.v-none { background: var(--line-2); color: var(--muted); }
+table.matrix .ms { color: var(--muted); font-family: var(--mono); font-size: 10.5px; margin-left: 4px; }
