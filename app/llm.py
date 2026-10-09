@@ -97,11 +97,11 @@ THINK_RE = re.compile(r"^.*?</think>\s*|<think>.*?</think>\s*", re.S)  # бло�
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))  # 5 отрывков ≈ 1500–2000 токенов; больше — не влезет в 4 ГБ видеопамяти
 
 
-def _chat_ollama(model, messages, temperature, max_tokens, schema=None):
+def _chat_ollama(model, messages, temperature, max_tokens, schema=None, num_ctx=None):
     """Нативный /api/chat: в отличие от /v1 позволяет задать окно контекста (num_ctx).
     Через /v1 Ollama молча обрезает длинный промпт с отрывками до окна по умолчанию."""
     body = {"model": model, "messages": messages, "stream": False,
-            "options": {"temperature": temperature, "num_ctx": NUM_CTX, "num_predict": max_tokens}}
+            "options": {"temperature": temperature, "num_ctx": num_ctx or NUM_CTX, "num_predict": max_tokens}}
     if schema:
         body["format"] = schema  # structured outputs: Ollama гарантирует JSON по схеме
     if model.startswith(("qwen3", "deepseek-r1")):
@@ -119,19 +119,23 @@ def _chat_ollama(model, messages, temperature, max_tokens, schema=None):
         raise LlmError("ollama вернула {}: {}".format(e.code, e.read().decode("utf-8", "replace")[:300]))
     except urllib.error.URLError as e:
         raise LlmError("ollama недоступна: {}".format(e.reason))
-    return data["message"].get("content") or "", data.get("prompt_eval_count", 0), data.get("eval_count", 0)
+    ms = lambda k: round(data.get(k, 0) / 1e6)  # Ollama отдаёт длительности в наносекундах
+    stats = {"load_ms": ms("load_duration"), "prompt_ms": ms("prompt_eval_duration"), "eval_ms": ms("eval_duration"),
+             "done_reason": data.get("done_reason")}
+    return data["message"].get("content") or "", data.get("prompt_eval_count", 0), data.get("eval_count", 0), stats
 
 
-def chat(full_model, messages, temperature=0.2, max_tokens=900, schema=None):
+def chat(full_model, messages, temperature=0.2, max_tokens=900, schema=None, num_ctx=None):
     """Один вызов модели. Возвращает {text, usage, latency_ms, model}.
     schema — JSON Schema ответа: у Ollama строгий формат, у остальных провайдеров — json_object
-    (если провайдер его не поддерживает, повторяем запрос без него; схема тогда описана в промпте)."""
+    (если провайдер его не поддерживает, повторяем запрос без него; схема тогда описана в промпте).
+    num_ctx — окно контекста Ollama (по умолчанию NUM_CTX); у облачных провайдеров не используется."""
     provider, model = split_model(full_model)
     t0 = time.time()
     if provider == "ollama":
-        text, p_tok, c_tok = _chat_ollama(model, messages, temperature, max_tokens, schema)
+        text, p_tok, c_tok, stats = _chat_ollama(model, messages, temperature, max_tokens, schema, num_ctx)
         return {"text": THINK_RE.sub("", text).strip(), "usage": {"prompt": p_tok, "completion": c_tok},
-                "latency_ms": round((time.time() - t0) * 1000), "model": full_model}
+                "latency_ms": round((time.time() - t0) * 1000), "model": full_model, "stats": stats}
     body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "stream": False}
     if schema:
         try:

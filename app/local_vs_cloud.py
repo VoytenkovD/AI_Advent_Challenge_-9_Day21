@@ -44,10 +44,10 @@ def _jaccard(a, b):
     return len(a & b) / len(a | b) if a | b else 1.0
 
 
-def run_one(q, model):
+def run_one(q, model, gen=None):
     t0 = time.time()
     try:
-        a = grounded.answer(q["q"], model, None, grounded.GATE_MIN, judge_model=model)
+        a = grounded.answer(q["q"], model, None, grounded.GATE_MIN, judge_model=model, gen=gen)
     except Exception as e:
         return {"status": "error", "error": "{}: {}".format(type(e).__name__, str(e)[:200]),
                 "latency_ms": round((time.time() - t0) * 1000)}
@@ -58,7 +58,8 @@ def run_one(q, model):
          "quote_texts": [x["quote"][:200] for x in a["quotes"]], "json_ok": a.get("json_ok"),
          "meaning": (a.get("judge_support") or {}).get("verdict"), "latency_ms": a["latency_ms"],
          "retrieval_ms": t.get("retrieval_ms", 0), "generate_ms": t.get("generate_ms", 0),
-         "gen_tokens": gen_tok, "tok_s": round(gen_tok / (t["generate_ms"] / 1000), 1) if t.get("generate_ms") else None}
+         "gen_tokens": gen_tok, "tok_s": round(gen_tok / (t["generate_ms"] / 1000), 1) if t.get("generate_ms") else None,
+         "prompt_tokens": (a.get("usage") or {}).get("prompt", 0), "llm_stats": a.get("llm_stats"), "gen": a.get("gen")}
     # верность по эталону: «не знаю» оценивает код, остальное — общий сильный судья
     if a["status"] == "unknown":
         r["verdict"] = "верно" if not q["chapters"] else "неверно"

@@ -32,6 +32,7 @@
   <button class="tab" data-tab="cite" role="tab"><b>08</b> Цитаты</button>
   <button class="tab" data-tab="chat" role="tab"><b>09</b> Чат</button>
   <button class="tab" data-tab="lvc" role="tab"><b>10</b> Локально vs облако</button>
+  <button class="tab" data-tab="opt" role="tab"><b>11</b> Оптимизация</button>
   <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
@@ -243,6 +244,27 @@
       <div class="panel"><div class="panel__title">Время ответа, секунды (медиана и 90-й перцентиль)</div><div id="lvc-chart"></div></div>
     </div>
     <div class="panel"><div class="panel__title">Вопросы × прогоны: вердикт судьи и время</div><div id="lvc-matrix"></div></div>
+  </section>
+  <!-- 11 ОПТИМИЗАЦИЯ ЛОКАЛЬНОЙ LLM -->
+  <section class="view" id="view-opt">
+    <div class="flow" id="opt-flow"></div>
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Оптимизация qwen2.5:3b под ответы с цитатами по «Моби Дику»</div>
+        <div class="muted small" style="margin-bottom:10px;">Поиск во всех профилях одинаковый; меняются параметры модели (temperature, max tokens, окно контекста), квантование и шаблон промпта. 10 контрольных вопросов × 3 прогона. Верность по эталону оценивает <b id="opt-judge"></b>, «не знаю» — код. Профили с «-fa» прогоняются после включения в Ollama flash attention и KV-кэша q8_0 (<span id="opt-env"></span>).</div>
+        <div class="controls" id="opt-profiles"></div>
+        <div class="controls"><label class="check"><input type="checkbox" id="opt-fresh"> заново (стереть прошлые результаты)</label><button class="btn btn--primary" id="btn-opt">▶ Запустить</button><span class="muted small" id="opt-meta"></span></div>
+        <div class="progress"><div class="progress__bar" id="opt-bar"></div></div>
+        <div class="console console--short" id="opt-console"><div class="muted">Журнал появится после запуска.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">До и после</div><div id="opt-verdict" class="small">—</div></div>
+    </div>
+    <div class="score" id="opt-cards"></div>
+    <div class="grid2">
+      <div class="panel"><div class="panel__title">Качество · скорость · ресурсы</div><div id="opt-table"></div></div>
+      <div class="panel"><div class="panel__title">Время ответа и память модели</div><div id="opt-chart"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Вопросы × прогоны: вердикт судьи и время</div><div id="opt-matrix"></div></div>
   </section></main>
 
 <script src="/app.js"></script>

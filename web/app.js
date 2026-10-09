@@ -1566,6 +1566,171 @@
     api('/api/lvc/status?after=0').then(function (s) { if (s.state === 'running' && !lvc.poll) { $('btn-lvc').disabled = true; lvc.poll = setInterval(lvcPoll, 2000); } });
   };
 
+  // ═════════════ 11 ОПТИМИЗАЦИЯ ЛОКАЛЬНОЙ LLM ═════════════
+  var opt = { data: null, after: 0, poll: null, refresh: null, built: false };
+  function mb(v) { return v == null ? '—' : (v / 1024).toFixed(2) + ' ГБ'; }
+  function num1(v) { return v == null ? '—' : v.toFixed(1); }
+
+  function optFlow() {
+    var box = clear($('opt-flow'));
+    [['g', 'вопрос'], ['', '→'], ['g', 'поиск + реранкер (как в Дне 28)'], ['', '→'], ['p', 'параметры: temperature · max tokens · окно'], ['', '→'],
+     ['p', 'квантование Q3 / Q4 / Q5 / Q8'], ['', '→'], ['p', 'промпт v2: цитаты → точный перевод'], ['', '→'], ['g', 'проверка цитат и смысла'], ['', '→'], ['r', 'ответ']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' ? h('i', { text: x[1] }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  var OPT_ROWS = [
+    ['Качество'],
+    ['верно (все прогоны)', function (s) { return s.quality.correct; }, pct, 1],
+    ['частично', function (s) { return s.quality.partial; }, pct, 0],
+    ['верно по большинству из 3', function (s) { return s.quality.majority_correct; }, function (v) { return v + '/10'; }, 1],
+    ['верно или частично по большинству', function (s) { return s.quality.majority_correct + s.quality.majority_partial; }, function (v) { return v + '/10'; }, 1],
+    ['ответов по существу', function (s) { return s.quality.answered; }, pct, 1],
+    ['цитат подтверждено текстом', function (s) { return s.quality.quotes_verified; }, pct, 1],
+    ['«не знаю» на ловушке', function (s) { return s.quality.trap_ok; }, pct, 1],
+    ['одинаковый вердикт во всех прогонах', function (s) { return s.stability.verdict_consistent; }, function (v) { return v + '/10'; }, 1],
+    ['Скорость'],
+    ['медиана ответа, с', function (s) { return s.speed.median_ms; }, sec, -1],
+    ['90-й перцентиль, с', function (s) { return s.speed.p90_ms; }, sec, -1],
+    ['генерация ответа (медиана), с', function (s) { return s.speed.median_generate_ms; }, sec, -1],
+    ['  загрузка модели в память, с', function (s) { return s.speed.median_load_ms; }, sec, -1],
+    ['  чтение промпта, с', function (s) { return s.speed.median_prompt_eval_ms; }, sec, -1],
+    ['  выдача токенов, с', function (s) { return s.speed.median_eval_ms; }, sec, -1],
+    ['скорость выдачи, ток/с', function (s) { return s.speed.eval_tok_s; }, num1, 1],
+    ['токенов в промпте (медиана)', function (s) { return s.speed.median_prompt_tokens; }, String, -1],
+    ['токенов в ответе (медиана)', function (s) { return s.speed.median_gen_tokens; }, String, -1],
+    ['обрезано по max tokens', function (s) { return s.speed.truncated; }, String, -1],
+    ['Ресурсы'],
+    ['модель в памяти (с KV-кэшем)', function (s) { return s.resources.model_mb; }, mb, -1],
+    ['  из них в видеопамяти', function (s) { return s.resources.model_vram_mb; }, mb, 0],
+    ['пик занятости GPU (все модели)', function (s) { return s.resources.gpu_peak_mb; }, mb, -1],
+    ['окно контекста', function (s) { return s.resources.ctx; }, String, 0]
+  ];
+
+  function optPids() { var d = opt.data; return d ? Object.keys(d.results).filter(function (p) { return d.results[p].summary; }) : []; }
+  function optLabel(p) { var r = opt.data.results[p]; return (r.profile && r.profile.label) || p; }
+  function optQuant(p) { var i = opt.data.results[p].info || {}; return i.quant || ''; }
+
+  function optRender() {
+    var d = opt.data, pids = optPids();
+    $('opt-meta').textContent = d ? ('обновлено ' + new Date(d.updated * 1000).toLocaleTimeString('ru-RU') + (d.finished ? ' · завершено' : ' · идёт…')) : '';
+    var cards = clear($('opt-cards')), table = clear($('opt-table')), chart = clear($('opt-chart')), matrix = clear($('opt-matrix'));
+    if (!pids.length) { cards.appendChild(h('div', { class: 'empty', text: 'Результатов пока нет — нажмите «Запустить».' })); clear($('opt-verdict')); return; }
+    var sums = pids.map(function (p) { return d.results[p].summary; });
+    pids.forEach(function (p, i) {
+      var s = sums[i];
+      cards.appendChild(h('div', { class: 'score__card local' },
+        h('div', { class: 'lvc-name' }, p, h('span', { class: 'tag local', text: optQuant(p) })),
+        h('div', { class: 'score__big', text: pct(s.quality.correct) }),
+        h('div', { class: 'stat__k', text: optLabel(p) }),
+        h('div', { class: 'lvc-rows' },
+          h('div', null, 'по большинству: ', h('b', { text: s.quality.majority_correct + '/10' }), ' · частично ', h('b', { text: String(s.quality.majority_partial) })),
+          h('div', null, 'медиана: ', h('b', { text: sec(s.speed.median_ms) + ' с' }), ' · ', h('b', { text: num1(s.speed.eval_tok_s) + ' ток/с' })),
+          h('div', null, 'память модели: ', h('b', { text: mb(s.resources.model_mb) })))));
+    });
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'метрика' }), pids.map(function (p) { return h('th', { style: 'text-align:right', title: optLabel(p), text: p }); })));
+    OPT_ROWS.forEach(function (row) {
+      if (row.length === 1) { tbl.appendChild(h('tr', null, h('td', { class: 'grp', colspan: pids.length + 1, text: row[0] }))); return; }
+      var vals = sums.map(function (s) { try { return row[1](s); } catch (e) { return null; } });
+      var nums = vals.filter(function (v) { return typeof v === 'number'; });
+      var best = row[3] && nums.length > 1 ? (row[3] > 0 ? Math.max.apply(null, nums) : Math.min.apply(null, nums)) : null;
+      tbl.appendChild(h('tr', null, h('td', { text: row[0] }), vals.map(function (v) {
+        return h('td', { class: 'num' + (best != null && v === best ? ' win' : ''), text: v == null ? '—' : row[2](v) });
+      })));
+    });
+    table.appendChild(tbl);
+    // график: время ответа и память
+    var W = 520, rowH = 30, left = 110, els = [], y0 = 18;
+    function bars(title, get, fmt, color) {
+      var maxv = Math.max.apply(null, sums.map(get).filter(function (v) { return v != null; })) || 1;
+      els.push(sv('text', { x: 0, y: y0, 'font-weight': 600 }, title)); y0 += 8;
+      sums.forEach(function (s, i) {
+        var v = get(s), w = v == null ? 0 : (v / maxv) * (W - left - 80);
+        els.push(sv('text', { x: left - 8, y: y0 + 17, 'text-anchor': 'end' }, pids[i]));
+        els.push(sv('rect', { x: left, y: y0 + 4, width: w, height: 20, fill: cssVar(color), opacity: pids[i] === 'base' ? 0.45 : 1 }));
+        els.push(sv('text', { x: left + w + 6, y: y0 + 18 }, v == null ? '—' : fmt(v)));
+        y0 += rowH;
+      });
+      y0 += 22;
+    }
+    bars('Медиана ответа, с', function (s) { return s.speed.median_ms; }, function (v) { return sec(v) + ' с'; }, '--rr');
+    bars('Память модели (вес + KV-кэш)', function (s) { return s.resources.model_mb; }, mb, '--plain');
+    chart.appendChild(svg(W, y0, els));
+    chart.appendChild(h('div', { class: 'muted small', text: 'Бледная полоса — исходная конфигурация (base). Время включает поиск, генерацию, проверку смысла и перезагрузки моделей в 4 ГБ видеопамяти.' }));
+    var mt = h('table', { class: 't matrix' }, h('tr', null, h('th', { text: 'вопрос' }), pids.map(function (p) { return h('th', { text: p }); })));
+    d.questions.forEach(function (q) {
+      mt.appendChild(h('tr', null, h('td', { text: q.q }), pids.map(function (p) {
+        var runs = (d.results[p].runs || {})[q.id] || [];
+        return h('td', null, h('div', { class: 'runs' }, runs.map(function (r) {
+          return h('span', { class: 'dot v-' + (r.verdict || 'none'), title: 'прогон ' + r.run + ': ' + r.status + ' → ' + (r.verdict || r.error || '') + '\n' + (r.answer || '').slice(0, 300) + (r.unverified ? '\n[пересказ модели] ' + r.unverified.slice(0, 200) : ''),
+            text: r.status === 'unknown' ? '?' : r.status === 'quotes' ? '«' : r.status === 'error' ? '!' : '' });
+        }), runs.length ? h('span', { class: 'ms', text: sec(runs.reduce(function (a, r) { return a + r.latency_ms; }, 0) / runs.length) + ' с' }) : null));
+      })));
+    });
+    matrix.appendChild(mt);
+    matrix.appendChild(h('div', { class: 'muted small', style: 'margin-top:6px', text: 'Цвет — вердикт судьи (зелёный верно, жёлтый частично, красный неверно); «?» — «не знаю», «» — ответ цитатами.' }));
+    optVerdict(pids, sums);
+  }
+
+  function optVerdict(pids, sums) {
+    var box = clear($('opt-verdict')), d = opt.data, bi = pids.indexOf('base');
+    var best = d.best && pids.indexOf(d.best) >= 0 ? pids.indexOf(d.best) : sums.reduce(function (b, s, i) {
+      return b < 0 || s.quality.correct > sums[b].quality.correct ||
+        (s.quality.correct === sums[b].quality.correct && s.speed.median_ms < sums[b].speed.median_ms) ? i : b; }, -1);
+    function line(name, s) {
+      return h('div', { style: 'margin-bottom:6px' }, h('b', { text: name }), ': верно ' + pct(s.quality.correct) + ' (по большинству ' + s.quality.majority_correct + '/10), медиана ' +
+        sec(s.speed.median_ms) + ' с, ' + num1(s.speed.eval_tok_s) + ' ток/с, модель ' + mb(s.resources.model_mb));
+    }
+    if (bi >= 0) box.appendChild(line('До (base)', sums[bi]));
+    if (best >= 0 && best !== bi) box.appendChild(line('После (' + pids[best] + ')', sums[best]));
+    box.appendChild(h('div', { class: 'muted', text: 'Профиль по умолчанию для локальных моделей в приложении: ' + (opt.localGen || '—') + '.' }));
+  }
+
+  function optLoad() {
+    return api('/api/opt/results').then(function (r) {
+      opt.data = r.data; opt.localGen = r.local_gen; $('opt-judge').textContent = r.judge;
+      $('opt-env').textContent = 'сейчас: OLLAMA_FLASH_ATTENTION=' + (r.env.OLLAMA_FLASH_ATTENTION || 'нет') + ', OLLAMA_KV_CACHE_TYPE=' + (r.env.OLLAMA_KV_CACHE_TYPE || 'нет');
+      if (!opt.built) {
+        opt.built = true;
+        var box = clear($('opt-profiles'));
+        Object.keys(r.profiles).forEach(function (p) {
+          box.appendChild(h('label', { class: 'lvc-model', title: r.profiles[p] }, h('input', { type: 'checkbox', value: p }), p));
+        });
+      }
+      optRender();
+    });
+  }
+
+  function optPoll() {
+    api('/api/opt/status?after=' + opt.after).then(function (s) {
+      var con = $('opt-console');
+      if (opt.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      opt.after += s.log.length; con.scrollTop = con.scrollHeight;
+      if (s.progress) $('opt-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state !== 'running') { clearInterval(opt.poll); opt.poll = null; $('btn-opt').disabled = false; optLoad(); }
+    }).catch(function () {});
+  }
+
+  $('btn-opt').addEventListener('click', function () {
+    var pids = Array.prototype.map.call(document.querySelectorAll('#opt-profiles input:checked'), function (i) { return i.value; });
+    if (!pids.length) { alert('Отметьте профили для прогона'); return; }
+    if (!confirm('Ответы будет оценивать облачный судья (вопрос, эталон и ответ уходят в облако). Прогон займёт ~15 минут на профиль. Продолжить?')) return;
+    opt.after = 0; clear($('opt-console'));
+    api('/api/opt/run', { profiles: pids, fresh: $('opt-fresh').checked }).then(function (r) {
+      if (!r.started) { alert('Прогон уже идёт'); return; }
+      $('btn-opt').disabled = true; if (!opt.poll) opt.poll = setInterval(optPoll, 2000);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.opt = function () {
+    optFlow();
+    optLoad();
+    if (!opt.refresh) opt.refresh = setInterval(function () {
+      if (document.getElementById('view-opt').classList.contains('active') && opt.data && !opt.data.finished) optLoad();
+    }, 5000);
+    api('/api/opt/status?after=0').then(function (s) { if (s.state === 'running' && !opt.poll) { $('btn-opt').disabled = true; opt.poll = setInterval(optPoll, 2000); } });
+  };
+
   loadModels().catch(function () {});
 
   // ───────────── старт ─────────────
