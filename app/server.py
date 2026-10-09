@@ -21,6 +21,8 @@ import experiment
 import grounded
 import indexer
 import llm
+import local_vs_cloud
+import optimize
 import rag
 import rerank
 import store
@@ -85,6 +87,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._guard(llm.catalog)
         if path == "/api/rag/questions":
             return self._guard(lambda: {"questions": rag.load_questions(), "strategy": rag.STRATEGY, "k": rag.TOP_K})
+        if path == "/api/lvc/status":
+            return self._guard(lambda: local_vs_cloud.JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/lvc/results":
+            return self._guard(lambda: {"data": local_vs_cloud.load(), "models": local_vs_cloud.MODELS,
+                                        "judge": local_vs_cloud.JUDGE, "runs": local_vs_cloud.RUNS})
+        if path == "/api/opt/status":
+            return self._guard(lambda: optimize.JOB.snapshot(int(arg("after", 0))))
+        if path == "/api/opt/results":
+            return self._guard(lambda: {"data": optimize.load(), "judge": local_vs_cloud.JUDGE, "runs": optimize.RUNS,
+                                        "profiles": {k: v["label"] for k, v in optimize.PROFILES.items()},
+                                        "local_gen": grounded.LOCAL_GEN, "env": optimize.ollama_env()})
         if path == "/api/chats":
             return self._guard(lambda: {"chats": chat.list_chats()})
         if path.startswith("/api/chats/"):
@@ -157,6 +170,14 @@ class Handler(BaseHTTPRequestHandler):
             modes = [m for m in (data.get("modes") or rag.MODES) if m in rag.MODES]
             return self._guard(lambda: rag.ask(q, data.get("model") or llm.DEFAULT_MODEL, int(data.get("k", rag.TOP_K)),
                                                params=data.get("params"), modes=modes))
+        if path == "/api/lvc/run":
+            data = self._body()
+            return self._guard(lambda: {"started": local_vs_cloud.start(data.get("models"), data.get("runs") or local_vs_cloud.RUNS,
+                                                                        bool(data.get("fresh"))), "state": local_vs_cloud.JOB.state})
+        if path == "/api/opt/run":
+            data = self._body()
+            return self._guard(lambda: {"started": optimize.start(data.get("profiles"), data.get("runs") or optimize.RUNS,
+                                                                  bool(data.get("fresh"))), "state": optimize.JOB.state})
         if path == "/api/chats":
             data = self._body()
             return self._guard(lambda: {"chat": chat.create_chat(data.get("title"))})
