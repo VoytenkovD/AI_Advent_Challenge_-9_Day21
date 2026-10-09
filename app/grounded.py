@@ -414,7 +414,7 @@ GEN_PROFILES = {
     "v5": dict(GEN_V1, name="v5", system=SYSTEM_V5, schema=SCHEMA_V5, template="v2", temperature=0.0, max_tokens=450,
                num_ctx=3072, judge=SUPPORT_JUDGE_V5, bilingual=True),
 }
-LOCAL_GEN = "v1"   # профиль по умолчанию для локальных моделей Ollama
+LOCAL_GEN = "v1-tuned"   # профиль по умолчанию для локальных моделей Ollama — лучший по замеру Дня 29
 
 
 def gen_profile(model, gen=None):

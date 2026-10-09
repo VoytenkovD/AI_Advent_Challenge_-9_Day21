@@ -44,7 +44,7 @@ def _jaccard(a, b):
     return len(a & b) / len(a | b) if a | b else 1.0
 
 
-def run_one(q, model, gen=None):
+def run_one(q, model, gen="v1"):   # День 28 сравнивает модели на одном промпте v1
     t0 = time.time()
     try:
         a = grounded.answer(q["q"], model, None, grounded.GATE_MIN, judge_model=model, gen=gen)
