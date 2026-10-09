@@ -1,0 +1,1 @@
+{"model": "qwen2.5:3b", "prompt": "Назови три планеты Солнечной системы через запятую.", "stream": false, "options": {"temperature": 0}}

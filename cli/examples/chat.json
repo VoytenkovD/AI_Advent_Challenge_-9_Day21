@@ -1,0 +1,3 @@
+{"model": "qwen2.5:3b", "stream": false, "options": {"temperature": 0},
+ "messages": [{"role": "system", "content": "Отвечай по-русски, кратко."},
+              {"role": "user", "content": "Объясни одним предложением, что такое HTTP API."}]}
