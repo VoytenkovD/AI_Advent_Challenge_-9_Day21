@@ -31,6 +31,7 @@
   <button class="tab" data-tab="rerank" role="tab"><b>07</b> Реранкинг</button>
   <button class="tab" data-tab="cite" role="tab"><b>08</b> Цитаты</button>
   <button class="tab" data-tab="chat" role="tab"><b>09</b> Чат</button>
+  <button class="tab" data-tab="lvc" role="tab"><b>10</b> Локально vs облако</button>
   <label class="model-pick"><span>LLM</span><select id="model-select"><option>загрузка…</option></select></label>
 </nav>
 
@@ -222,7 +223,27 @@
       <div id="sc-results"></div>
     </div>
   </section>
-</main>
+  <!-- 10 ЛОКАЛЬНО VS ОБЛАКО -->
+  <section class="view" id="view-lvc">
+    <div class="flow" id="lvc-flow"></div>
+    <div class="grid3">
+      <div class="panel" style="grid-column: span 2;">
+        <div class="panel__title">Сравнение генерации: локальные модели против облачной</div>
+        <div class="muted small" style="margin-bottom:10px;">Поиск во всех режимах один и тот же и полностью локальный: индекс Недели 6 (SQLite, bge-m3) → косинус → реранкер Qwen3 → порог «не знаю». Меняется только модель, которая пишет ответ и проверяет смысл. 10 контрольных вопросов Дня 22 × 3 прогона. Верность по эталону для всех режимов оценивает один судья — <b id="lvc-judge"></b> (инструмент измерения, не часть системы).</div>
+        <div class="controls" id="lvc-models"></div>
+        <div class="controls"><label class="check"><input type="checkbox" id="lvc-fresh"> заново (стереть прошлые результаты)</label><button class="btn btn--primary" id="btn-lvc">▶ Запустить сравнение</button><span class="muted small" id="lvc-meta"></span></div>
+        <div class="progress"><div class="progress__bar" id="lvc-bar"></div></div>
+        <div class="console console--short" id="lvc-console"><div class="muted">Журнал появится после запуска.</div></div>
+      </div>
+      <div class="panel"><div class="panel__title">Итог</div><div id="lvc-verdict" class="small">—</div></div>
+    </div>
+    <div class="score" id="lvc-cards"></div>
+    <div class="grid2">
+      <div class="panel"><div class="panel__title">Качество · скорость · стабильность</div><div id="lvc-table"></div></div>
+      <div class="panel"><div class="panel__title">Время ответа, секунды (медиана и 90-й перцентиль)</div><div id="lvc-chart"></div></div>
+    </div>
+    <div class="panel"><div class="panel__title">Вопросы × прогоны: вердикт судьи и время</div><div id="lvc-matrix"></div></div>
+  </section></main>
 
 <script src="/app.js"></script>
 </body>

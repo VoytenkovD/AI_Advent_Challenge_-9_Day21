@@ -166,7 +166,8 @@ def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None,
     best = max((s["rel"] if s["rel"] is not None else (1 + s["score"]) / 2 for s in sources), default=0.0)
     out = {"question": question, "model": model, "params": p, "gate_min": gate_min, "best_rel": round(best, 4),
            "funnel": {k: f[k] for k in ("query", "candidates", "counts", "ms")}, "context": sources,
-           "sources": [], "quotes": [], "rejected": [], "support": None}
+           "sources": [], "quotes": [], "rejected": [], "support": None,
+           "timing": {"retrieval_ms": round((time.time() - t0) * 1000), "generate_ms": 0}}
 
     # 1. порог уверенности — до вызова LLM
     if not sources or best < gate_min:
@@ -179,6 +180,7 @@ def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None,
 
     # 2. ответ модели в JSON по схеме
     system = SYSTEM + ("\n\n" + memory if memory else "")
+    t_gen = time.time()
     res = llm.chat(model, [{"role": "system", "content": system}] + list(dialog or []) +
                    [{"role": "user", "content": _prompt(question, sources)}],
                    temperature=0.1, max_tokens=700, schema=SCHEMA)
@@ -186,7 +188,10 @@ def answer(question, model, params=None, gate_min=GATE_MIN, judge_model=None,
         res = llm.chat(model, [{"role": "system", "content": system + "\n\nВАЖНО: поле answer пиши только по-русски."}]
                        + list(dialog or []) + [{"role": "user", "content": _prompt(question, sources)}],
                        temperature=0.0, max_tokens=700, schema=SCHEMA)
-    data = _parse(res["text"]) or {"status": "answered", "answer": res["text"], "quotes": []}
+    out["timing"]["generate_ms"] = round((time.time() - t_gen) * 1000)
+    parsed = _parse(res["text"])
+    out["json_ok"] = parsed is not None
+    data = parsed or {"status": "answered", "answer": res["text"], "quotes": []}
     out.update(usage=res["usage"], raw=res["text"])
     answer_text = (data.get("answer") or "").strip()
 

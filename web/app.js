@@ -1407,6 +1407,165 @@
     api('/api/chat-eval/status?after=0').then(function (s) { if (s.state === 'running' && !cht.poll) { $('btn-sc').disabled = true; cht.poll = setInterval(scPoll, 2000); } });
   };
 
+  // ═════════════ 10 ЛОКАЛЬНО VS ОБЛАКО ═════════════
+  var lvc = { data: null, models: [], after: 0, poll: null, refresh: null };
+  function isLocal(m) { return m.indexOf('ollama:') === 0; }
+  function shortName(m) { return m.split(':').slice(1).join(':'); }
+  function sec(ms) { return ms == null ? '—' : (ms / 1000).toFixed(1); }
+
+  function lvcFlow() {
+    var box = clear($('lvc-flow'));
+    [['g', 'вопрос'], ['', '→'], ['g', 'bge-m3 + реранкер Qwen3 (Ollama, локально)'], ['', '→'], ['g', 'порог «не знаю»'], ['', '→'],
+     ['g', 'qwen2.5:3b / llama3.2:3b — локально'], ['', '|'], ['p', 'gpt-4.1 — облако'], ['', '→'], ['g', 'проверка цитат и смысла'], ['', '→'], ['r', 'ответ с источниками']
+    ].forEach(function (x) { box.appendChild(x[1] === '→' || x[1] === '|' ? h('i', { text: x[1] }) : h('span', { class: x[0], text: x[1] })); });
+  }
+
+  var LVC_ROWS = [
+    ['Качество'],
+    ['верно (все прогоны)', function (s) { return s.quality.correct; }, pct, 1],
+    ['частично', function (s) { return s.quality.partial; }, pct, 0],
+    ['неверно', function (s) { return s.quality.wrong; }, pct, -1],
+    ['верно по большинству из 3', function (s) { return s.quality.majority_correct; }, function (v) { return v + '/10'; }, 1],
+    ['ответов по существу', function (s) { return s.quality.answered; }, pct, 1],
+    ['цитат подтверждено текстом', function (s) { return s.quality.quotes_verified; }, pct, 1],
+    ['«не знаю» на ловушке', function (s) { return s.quality.trap_ok; }, pct, 1],
+    ['Скорость'],
+    ['медиана ответа, с', function (s) { return s.speed.median_ms; }, sec, -1],
+    ['90-й перцентиль, с', function (s) { return s.speed.p90_ms; }, sec, -1],
+    ['генерация (медиана), с', function (s) { return s.speed.median_generate_ms; }, sec, -1],
+    ['поиск (медиана), с', function (s) { return s.speed.median_retrieval_ms; }, sec, -1],
+    ['токенов/с при генерации', function (s) { return s.speed.median_tok_s; }, function (v) { return v == null ? '—' : v.toFixed(1); }, 1],
+    ['Стабильность'],
+    ['одинаковый вердикт во всех прогонах', function (s) { return s.stability.verdict_consistent; }, function (v) { return v + '/10'; }, 1],
+    ['одинаковый статус ответа', function (s) { return s.stability.status_consistent; }, function (v) { return v + '/10'; }, 1],
+    ['похожесть ответов между прогонами', function (s) { return s.stability.answer_similarity; }, function (v) { return v == null ? '—' : v.toFixed(2); }, 1],
+    ['валидный JSON', function (s) { return s.stability.json_ok; }, pct, 1],
+    ['ошибки и таймауты', function (s) { return s.stability.errors; }, String, -1],
+    ['разброс времени (CV)', function (s) { return s.stability.latency_cv; }, function (v) { return v == null ? '—' : v.toFixed(2); }, -1]
+  ];
+
+  function lvcSummaries() {
+    var d = lvc.data;
+    if (!d) return [];
+    return Object.keys(d.results).map(function (m) { return d.results[m].summary; }).filter(Boolean);
+  }
+
+  function lvcRender() {
+    var d = lvc.data, sums = lvcSummaries();
+    $('lvc-meta').textContent = d ? ('обновлено ' + new Date((d.updated || d.started) * 1000).toLocaleTimeString('ru-RU') + (d.finished ? ' · завершено' : ' · идёт…')) : '';
+    var cards = clear($('lvc-cards')), table = clear($('lvc-table')), chart = clear($('lvc-chart')), matrix = clear($('lvc-matrix'));
+    if (!sums.length) { cards.appendChild(h('div', { class: 'empty', text: 'Результатов пока нет — нажмите «Запустить сравнение».' })); return; }
+    sums.forEach(function (s) {
+      cards.appendChild(h('div', { class: 'score__card ' + (s.local ? 'local' : 'cloud') },
+        h('div', { class: 'lvc-name' }, shortName(s.model), h('span', { class: 'tag ' + (s.local ? 'local' : 'cloud'), text: s.local ? '100% локально' : 'облако' })),
+        h('div', { class: 'score__big', text: pct(s.quality.correct) }),
+        h('div', { class: 'stat__k', text: 'верно по эталону, ' + s.runs + ' ответов' }),
+        h('div', { class: 'lvc-rows' },
+          h('div', null, 'по большинству: ', h('b', { text: s.quality.majority_correct + '/10' })),
+          h('div', null, 'медиана: ', h('b', { text: sec(s.speed.median_ms) + ' с' }), ' · генерация ', h('b', { text: sec(s.speed.median_generate_ms) + ' с' })),
+          h('div', null, 'стабильность вердикта: ', h('b', { text: s.stability.verdict_consistent + '/10' })))));
+    });
+    // таблица метрик
+    var tbl = h('table', { class: 't' }, h('tr', null, h('th', { text: 'метрика' }), sums.map(function (s) {
+      return h('th', { style: 'text-align:right;color:var(--' + (s.local ? 'rr' : 'plain') + ')', text: shortName(s.model) });
+    })));
+    LVC_ROWS.forEach(function (row) {
+      if (row.length === 1) { tbl.appendChild(h('tr', null, h('td', { class: 'grp', colspan: sums.length + 1, text: row[0] }))); return; }
+      var vals = sums.map(function (s) { return row[1](s); });
+      var nums = vals.filter(function (v) { return typeof v === 'number'; });
+      var best = row[3] && nums.length > 1 ? (row[3] > 0 ? Math.max.apply(null, nums) : Math.min.apply(null, nums)) : null;
+      tbl.appendChild(h('tr', null, h('td', { text: row[0] }), vals.map(function (v) {
+        return h('td', { class: 'num' + (best != null && v === best ? ' win' : ''), text: v == null ? '—' : row[2](v) });
+      })));
+    });
+    table.appendChild(tbl);
+    // график времени
+    var W = 520, rowH = 44, H = sums.length * rowH + 30, left = 150, maxv = Math.max.apply(null, sums.map(function (s) { return s.speed.p90_ms || 0; })) || 1;
+    var els = [];
+    sums.forEach(function (s, i) {
+      var y = 10 + i * rowH, color = cssVar(s.local ? '--rr' : '--plain'), sc = function (v) { return (v / maxv) * (W - left - 60); };
+      els.push(sv('text', { x: left - 8, y: y + 17, 'text-anchor': 'end' }, shortName(s.model)));
+      els.push(sv('rect', { x: left, y: y + 4, width: sc(s.speed.p90_ms || 0), height: 22, fill: color, opacity: 0.25 }));
+      els.push(sv('rect', { x: left, y: y + 4, width: sc(s.speed.median_ms || 0), height: 22, fill: color }));
+      els.push(sv('text', { x: left + sc(s.speed.p90_ms || 0) + 6, y: y + 19 }, sec(s.speed.median_ms) + ' / ' + sec(s.speed.p90_ms) + ' с'));
+    });
+    chart.appendChild(svg(W, H, els));
+    chart.appendChild(h('div', { class: 'muted small', text: 'Тёмная полоса — медиана, светлая — 90-й перцентиль. Поиск во всех режимах одинаковый; разница — генерация и проверка смысла.' }));
+    // матрица вопросов
+    var mt = h('table', { class: 't matrix' }, h('tr', null, h('th', { text: 'вопрос' }), sums.map(function (s) { return h('th', { text: shortName(s.model) }); })));
+    d.questions.forEach(function (q) {
+      mt.appendChild(h('tr', null, h('td', { text: q.q }), sums.map(function (s) {
+        var runs = ((d.results[s.model] || {}).runs || {})[q.id] || [];
+        return h('td', null, h('div', { class: 'runs' }, runs.map(function (r) {
+          var v = r.verdict || 'none';
+          return h('span', { class: 'dot v-' + v, title: 'прогон ' + r.run + ': ' + r.status + ' → ' + (r.verdict || r.error || '') + '\n' + (r.answer || '').slice(0, 300),
+            text: r.status === 'unknown' ? '?' : r.status === 'quotes' ? '«' : r.status === 'error' ? '!' : '' });
+        }), runs.length ? h('span', { class: 'ms', text: sec(runs.reduce(function (a, r) { return a + r.latency_ms; }, 0) / runs.length) + ' с' }) : null));
+      })));
+    });
+    matrix.appendChild(mt);
+    matrix.appendChild(h('div', { class: 'muted small', style: 'margin-top:6px', text: 'Цвет — вердикт судьи (зелёный верно, жёлтый частично, красный неверно); «?» — ответ «не знаю», «» — ответ цитатами. Наведите на квадрат, чтобы увидеть ответ.' }));
+    lvcVerdict(sums);
+  }
+
+  function lvcVerdict(sums) {
+    var box = clear($('lvc-verdict'));
+    var loc = sums.filter(function (s) { return s.local; }), cloud = sums.filter(function (s) { return !s.local; })[0];
+    if (!loc.length) return;
+    var bestLoc = loc.slice().sort(function (a, b) { return b.quality.correct - a.quality.correct; })[0];
+    box.appendChild(h('div', { style: 'margin-bottom:6px' }, 'Лучшая локальная: ', h('b', { text: shortName(bestLoc.model) }), ' — верно ' + pct(bestLoc.quality.correct) +
+      ', медиана ' + sec(bestLoc.speed.median_ms) + ' с.'));
+    if (cloud) box.appendChild(h('div', { style: 'margin-bottom:6px' }, 'Облако ', h('b', { text: shortName(cloud.model) }), ' — верно ' + pct(cloud.quality.correct) +
+      ', медиана ' + sec(cloud.speed.median_ms) + ' с.'));
+    box.appendChild(h('div', { class: 'muted', text: 'Поиск, цитаты и «не знаю» во всех режимах локальные; в облако уходят только вопрос и найденные отрывки — и только в облачном режиме.' }));
+  }
+
+  function lvcLoad() {
+    return api('/api/lvc/results').then(function (r) {
+      lvc.data = r.data; $('lvc-judge').textContent = r.judge;
+      if (!lvc.models.length) {
+        lvc.models = r.models;
+        var box = clear($('lvc-models'));
+        r.models.forEach(function (m) {
+          box.appendChild(h('label', { class: 'lvc-model' }, h('input', { type: 'checkbox', checked: 'checked', value: m }), shortName(m),
+            h('span', { class: 'tag ' + (isLocal(m) ? 'local' : 'cloud'), text: isLocal(m) ? 'локально' : 'облако' })));
+        });
+      }
+      lvcRender();
+    });
+  }
+
+  function lvcPoll() {
+    api('/api/lvc/status?after=' + lvc.after).then(function (s) {
+      var con = $('lvc-console');
+      if (lvc.after === 0 && s.log.length) clear(con);
+      s.log.forEach(function (e) { con.appendChild(logLine(e)); });
+      lvc.after += s.log.length; con.scrollTop = con.scrollHeight;
+      if (s.progress) $('lvc-bar').style.width = Math.round(s.progress.done / s.progress.total * 100) + '%';
+      if (s.state !== 'running') { clearInterval(lvc.poll); lvc.poll = null; $('btn-lvc').disabled = false; }
+    }).catch(function () {});
+  }
+
+  $('btn-lvc').addEventListener('click', function () {
+    var models = Array.prototype.map.call(document.querySelectorAll('#lvc-models input:checked'), function (i) { return i.value; });
+    if (!models.length) return;
+    if (models.some(function (m) { return !isLocal(m); }) && !confirm('В облачном режиме вопросы и найденные отрывки книги уйдут в облако по вашему ключу. Продолжить?')) return;
+    lvc.after = 0; clear($('lvc-console'));
+    api('/api/lvc/run', { models: models, fresh: $('lvc-fresh').checked }).then(function (r) {
+      if (!r.started) { alert('Сравнение уже идёт'); return; }
+      $('btn-lvc').disabled = true; if (!lvc.poll) lvc.poll = setInterval(lvcPoll, 2000);
+    }).catch(function (e) { alert(e.message); });
+  });
+
+  loaders.lvc = function () {
+    lvcFlow();
+    lvcLoad();
+    if (!lvc.refresh) lvc.refresh = setInterval(function () {   // результаты обновляются и при прогоне из терминала
+      if (document.getElementById('view-lvc').classList.contains('active') && lvc.data && !lvc.data.finished) lvcLoad();
+    }, 5000);
+    api('/api/lvc/status?after=0').then(function (s) { if (s.state === 'running' && !lvc.poll) { $('btn-lvc').disabled = true; lvc.poll = setInterval(lvcPoll, 2000); } });
+  };
+
   loadModels().catch(function () {});
 
   // ───────────── старт ─────────────
